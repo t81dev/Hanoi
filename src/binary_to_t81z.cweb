@@ -1,0 +1,1202 @@
+@* Binary to T81Z Compressor *@
+This program converts binary input (from a file or stdin) into a ternary sequence (trits: -1, 0, +1), compresses it using RLE or Huffman coding, and outputs a T81Z file with metadata and CRC32 checksum. It supports command-line options for input/output files, compression method, bit-to-trit chunk size, decompression, verification, and alternate output formats (t81ascii, t81hex). Final enhancements include format hooks for ASCII/hex output, full Huffman table serialization, and distinct exit codes for usage errors (1), file I/O errors (2), decompression failures (3), and CRC mismatches (4).
+@c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <zlib.h> // For CRC32
+#define TRIT_VALUES 3
+#define MAX_CODE_LENGTH 8
+#define DEFAULT_CHUNK_SIZE 5 // Bits per 3-trit group
+// Exit codes
+#define EXIT_USAGE 1
+#define EXIT_IO 2
+#define EXIT_DECOMPRESS 3
+#define EXIT_CRC 4
+typedef int8_t Trit; // -1, 0, +1
+typedef struct {
+    Trit* data; // Dynamic array
+    int length;
+    int capacity;
+} T81Data;
+typedef struct {
+    char magic[4];      // 'T81Z'
+    uint8_t version;    // Format version (1)
+    uint32_t original_length; // Increased to uint32_t
+    char method[4];     // 'RLE' or 'HUF'
+    uint32_t crc32;     // Checksum of original trit data
+    uint8_t chunk_size; // Bits per trit group
+    uint8_t huff_table[TRIT_VALUES * (MAX_CODE_LENGTH + 1)]; // Code lengths + codes
+} T81ZHeader;
+typedef struct {
+    uint8_t code[MAX_CODE_LENGTH];
+    int length;
+} HuffmanCode;
+typedef struct {
+    HuffmanCode codes[TRIT_VALUES];
+} HuffmanTable;
+@<Global Variables@>
+@<Binary to Ternary Conversion@>
+@<Compression Routines@>
+@<Decompression Routines@>
+@<Entropy Analysis@>
+@<File Output Utilities@>
+@<Huffman Utilities@>
+@<Command-Line Parsing@>
+@<Utility Functions@>
+@<Testing Utilities@>
+@<Format Handlers@>
+int main(int argc, char* argv[]) {
+    char* input_file = NULL;
+    char* output_file = "output.t81z";
+    char* method = "HUF";
+    char* format = NULL;
+    int chunk_size = DEFAULT_CHUNK_SIZE;
+    int decompress = 0;
+    int verify = 0;
+
+@<Parse Command-Line Arguments@>
+
+if (verify) {
+    if (!verify_t81z(input_file, output_file)) {
+        fprintf(stderr, "Verification failed\n");
+        return EXIT_CRC;
+    }
+    return 0;
+}
+
+if (decompress) {
+    if (format) {
+        fprintf(stderr, "Format option not supported for decompression\n");
+        return EXIT_USAGE;
+    }
+    if (!decompress_t81z(input_file, output_file)) {
+        fprintf(stderr, "Decompression failed\n");
+        return EXIT_DECOMPRESS;
+    }
+    return 0;
+}
+
+// Read binary input dynamically
+uint8_t* binary_buffer = NULL;
+int binary_length = 0, buffer_capacity = 1024;
+FILE* input = (input_file && strcmp(input_file, "-") != 0) ? fopen(input_file, "rb") : stdin;
+if (!input) {
+    fprintf(stderr, "Error: Could not open input %s\n", input_file ? input_file : "stdin");
+    return EXIT_IO;
+}
+binary_buffer = malloc(buffer_capacity);
+if (!binary_buffer) {
+    fprintf(stderr, "Memory allocation failed\n");
+    if (input != stdin) fclose(input);
+    return EXIT_IO;
+}
+while (1) {
+    if (binary_length >= buffer_capacity) {
+        buffer_capacity *= 2;
+        uint8_t* temp = realloc(binary_buffer, buffer_capacity);
+        if (!temp) {
+            fprintf(stderr, "Memory reallocation failed\n");
+            free(binary_buffer);
+            if (input != stdin) fclose(input);
+            return EXIT_IO;
+        }
+        binary_buffer = temp;
+    }
+    int read = fread(binary_buffer + binary_length, 1, buffer_capacity - binary_length, input);
+    binary_length += read;
+    if (read == 0) break;
+}
+if (input != stdin) fclose(input);
+
+// Convert to ternary
+T81Data trit_data = { .data = NULL, .length = 0, .capacity = 1024 };
+trit_data.data = malloc(trit_data.capacity * sizeof(Trit));
+if (!trit_data.data) {
+    fprintf(stderr, "Memory allocation failed\n");
+    free(binary_buffer);
+    return EXIT_IO;
+}
+clock_t start = clock();
+if (!binary_to_trits(binary_buffer, binary_length, &trit_data, chunk_size)) {
+    fprintf(stderr, "Binary to trit conversion failed\n");
+    free(binary_buffer);
+    free(trit_data.data);
+    return EXIT_IO;
+}
+free(binary_buffer);
+
+if (format) {
+    if (strcmp(output_file, "output.t81z") != 0 && strcmp(output_file, "-") != 0) {
+        fprintf(stderr, "Format option requires output to stdout ('-')\n");
+        free(trit_data.data);
+        return EXIT_USAGE;
+    }
+    FILE* out = (strcmp(output_file, "-") == 0) ? stdout : fopen(output_file, "w");
+    if (!out) {
+        fprintf(stderr, "Error: Could not open output %s\n", output_file);
+        free(trit_data.data);
+        return EXIT_IO;
+    }
+    int success = (strcmp(format, "t81ascii") == 0) ? format_t81ascii(&trit_data, out) :
+                  format_t81hex(&trit_data, out);
+    if (out != stdout) fclose(out);
+    free(trit_data.data);
+    return success ? 0 : EXIT_IO;
+}
+
+// Compress
+uint8_t* compressed_buffer = malloc(trit_data.length * 2);
+int compressed_length = 0;
+HuffmanTable huff_table;
+if (!compressed_buffer) {
+    fprintf(stderr, "Memory allocation failed\n");
+    free(trit_data.data);
+    return EXIT_IO;
+}
+if (strcmp(method, "RLE") == 0) {
+    if (!rle_compress(&trit_data, compressed_buffer, &compressed_length)) {
+        fprintf(stderr, "RLE compression failed\n");
+        free(compressed_buffer);
+        free(trit_data.data);
+        return EXIT_IO;
+    }
+} else if (strcmp(method, "HUF") == 0) {
+    if (!build_huffman_table(&trit_data, &huff_table)) {
+        fprintf(stderr, "Huffman table build failed\n");
+        free(compressed_buffer);
+        free(trit_data.data);
+        return EXIT_IO;
+    }
+    if (!huffman_compress(&trit_data, compressed_buffer, &compressed_length, &huff_table)) {
+        fprintf(stderr, "Huffman compression failed\n");
+        free(compressed_buffer);
+        free(trit_data.data);
+        return EXIT_IO;
+    }
+} else {
+    fprintf(stderr, "Unknown compression method: %s\n", method);
+    free(compressed_buffer);
+    free(trit_data.data);
+    return EXIT_USAGE;
+}
+
+// Write output
+if (!write_compressed_file(output_file, &trit_data, compressed_buffer, compressed_length, method, chunk_size, &huff_table)) {
+    fprintf(stderr, "Failed to write output file\n");
+    free(compressed_buffer);
+    free(trit_data.data);
+    return EXIT_IO;
+}
+
+// Benchmark
+double time_taken = (double)(clock() - start) / CLOCKS_PER_SEC;
+double ratio = (double)compressed_length / (trit_data.length * sizeof(Trit));
+double entropy = entropy_score(&trit_data);
+
+printf("Binary to T81Z Conversion and Compression:\n");
+printf("  Input binary size: %d bytes\n", binary_length);
+printf("  Ternary size: %d trits (%d bytes)\n", trit_data.length, trit_data.length * (int)sizeof(Trit));
+printf("  Compressed size: %d bytes\n", compressed_length);
+printf("  Compression ratio: %.2f (compressed/ternary)\n", ratio);
+printf("  Entropy: %.2f bits/trit\n", entropy);
+printf("  Time: %.4f seconds\n", time_taken);
+printf("  Output file: %s\n", output_file);
+
+free(compressed_buffer);
+free(trit_data.data);
+return 0;
+
+}
+@*1 Global Variables
+@<Global Variables@>=
+// Lookup tables for different chunk sizes
+static const uint8_t bit_to_trit_map_4[16][2] = {
+    {-1, -1}, {-1, 0}, {-1, 1}, {0, -1}, {0, 0}, {0, 1}, {1, -1}, {1, 0},
+    {1, 1}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}
+};
+static const uint8_t bit_to_trit_map_5[32][3] = {
+    {-1, -1, -1}, {-1, -1, 0}, {-1, -1, 1}, {-1, 0, -1}, {-1, 0, 0}, {-1, 0, 1}, {-1, 1, -1}, {-1, 1, 0},
+    {-1, 1, 1}, {0, -1, -1}, {0, -1, 0}, {0, -1, 1}, {0, 0, -1}, {0, 0, 0}, {0, 0, 1}, {0, 1, -1},
+    {0, 1, 0}, {0, 1, 1}, {1, -1, -1}, {1, -1, 0}, {1, -1, 1}, {1, 0, -1}, {1, 0, 0}, {1, 0, 1},
+    {1, 1, -1}, {1, 1, 0}, {1, 1, 1}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}
+};
+static const uint8_t bit_to_trit_map_6[64][4] = {
+    {-1, -1, -1, -1}, {-1, -1, -1, 0}, {-1, -1, -1, 1}, {-1, -1, 0, -1}, {-1, -1, 0, 0}, {-1, -1, 0, 1},
+    {-1, -1, 1, -1}, {-1, -1, 1, 0}, {-1, -1, 1, 1}, {-1, 0, -1, -1}, {-1, 0, -1, 0}, {-1, 0, -1, 1},
+    {-1, 0, 0, -1}, {-1, 0, 0, 0}, {-1, 0, 0, 1}, {-1, 0, 1, -1}, {-1, 0, 1, 0}, {-1, 0, 1, 1},
+    {-1, 1, -1, -1}, {-1, 1, -1, 0}, {-1, 1, -1, 1}, {-1, 1, 0, -1}, {-1, 1, 0, 0}, {-1, 1, 0, 1},
+    {-1, 1, 1, -1}, {-1, 1, 1, 0}, {-1, 1, 1, 1}, {0, -1, -1, -1}, {0, -1, -1, 0}, {0, -1, -1, 1},
+    {0, -1, 0, -1}, {0, -1, 0, 0}, {0, -1, 0, 1}, {0, -1, 1, -1}, {0, -1, 1, 0}, {0, -1, 1, 1},
+    {0, 0, -1, -1}, {0, 0, -1, 0}, {0, 0, -1, 1}, {0, 0, 0, -1}, {0, 0, 0, 0}, {0, 0, 0, 1},
+    {0, 0, 1, -1}, {0, 0, 1, 0}, {0, 0, 1, 1}, {0, 1, -1, -1}, {0, 1, -1, 0}, {0, 1, -1, 1},
+    {0, 1, 0, -1}, {0, 1, 0, 0}, {0, 1, 0, 1}, {0, 1, 1, -1}, {0, 1, 1, 0}, {0, 1, 1, 1},
+    {1, -1, -1, -1}, {1, -1, -1, 0}, {1, -1, -1, 1}, {1, -1, 0, -1}, {1, -1, 0, 0}, {1, -1, 0, 1},
+    {1, -1, 1, -1}, {1, -1, 1, 0}, {1, -1, 1, 1}, {0, 0, 0, 0}
+};
+@1 Binary to Ternary Conversion
+@<Binary to Ternary Conversion@>=
+int binary_to_trits(const uint8_t binary, int binary_length, T81Data* trits, int chunk_size) {
+    int trit_count = (chunk_size == 4) ? 2 : (chunk_size == 5) ? 3 : 4;
+    const uint8_t (*map)[trit_count] = (chunk_size == 4) ? bit_to_trit_map_4 :
+                                       (chunk_size == 5) ? bit_to_trit_map_5 : bit_to_trit_map_6;
+    int max_value = (chunk_size == 4) ? 9 : (chunk_size == 5) ? 27 : 81;
+    trits->length = 0;
+    int bit_pos = 0;
+    while (bit_pos < binary_length * 8) {
+        if (trits->length + trit_count > trits->capacity) {
+            trits->capacity = 2;
+            Trit temp = realloc(trits->data, trits->capacity * sizeof(Trit));
+            if (!temp) {
+                fprintf(stderr, "Memory reallocation failed\n");
+                return 0;
+            }
+            trits->data = temp;
+        }
+        int value = 0;
+        int bits_read = 0;
+        for (int i = 0; i < chunk_size && bit_pos < binary_length * 8; ++i) {
+            value = (value << 1) | ((binary[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1);
+            bit_pos++;
+            bits_read++;
+        }
+        if (bits_read == chunk_size && value < max_value) {
+            for (int i = 0; i < trit_count; ++i) {
+                trits->data[trits->length++] = map[value][i];
+            }
+        } else {
+            for (int i = bits_read; i < chunk_size && trits->length < trits->capacity; ++i) {
+                trits->data[trits->length++] = 0;
+            }
+        }
+    }
+    return 1;
+}
+@1 Compression Routines
+@<Compression Routines@>=
+int rle_compress(const T81Data data, uint8_t* buffer, int* out_length) {
+    *out_length = 0;
+    for (int i = 0; i < data->length; ) {
+        Trit t = data->data[i];
+        if (t < -1 || t > 1) {
+            fprintf(stderr, "Invalid trit: %d\n", t);
+            return 0;
+        }
+        int run = 1;
+        while (i + run < data->length && data->data[i + run] == t && run < 255) {
+            run++;
+        }
+        if (*out_length + 2 > data->length * 2) {
+            fprintf(stderr, "Buffer overflow in RLE compression\n");
+            return 0;
+        }
+        buffer[(*out_length)++] = (uint8_t)(t + 1);
+        buffer[(*out_length)++] = (uint8_t)run;
+        i += run;
+    }
+    return 1;
+}
+@1 Decompression Routines
+@<Decompression Routines@>=
+int rle_decompress(const uint8_t buffer, int buffer_length, T81Data* data) {
+    data->length = 0;
+    for (int i = 0; i < buffer_length - 1; i += 2) {
+        Trit t = (Trit)buffer[i] - 1;
+        int run = buffer[i + 1];
+        if (data->length + run > data->capacity) {
+            data->capacity = (data->length + run) * 2;
+            Trit* temp = realloc(data->data, data->capacity * sizeof(Trit));
+            if (!temp) {
+                fprintf(stderr, "Memory reallocation failed\n");
+                return 0;
+            }
+            data->data = temp;
+        }
+        for (int j = 0; j < run; ++j) {
+            data->data[data->length++] = t;
+        }
+    }
+    return 1;
+}
+int huffman_decompress(const uint8_t* buffer, int buffer_length, T81Data* data, HuffmanTable* table, int trit_count) {
+    data->length = 0;
+    int bit_pos = 0;
+    while (bit_pos < buffer_length * 8 && data->length < trit_count) {
+        if (data->length >= data->capacity) {
+            data->capacity = 2;
+            Trit temp = realloc(data->data, data->capacity * sizeof(Trit));
+            if (!temp) {
+                fprintf(stderr, "Memory reallocation failed\n");
+                return 0;
+            }
+            data->data = temp;
+        }
+        int code = 0, code_len = 0;
+        for (int i = 0; i < MAX_CODE_LENGTH && bit_pos < buffer_length * 8; ++i) {
+            code = (code << 1) | ((buffer[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1);
+            code_len++;
+            bit_pos++;
+            for (int j = 0; j < TRIT_VALUES; ++j) {
+                if (table->codes[j].length == code_len && code_matches(table->codes[j], code, code_len)) {
+                    data->data[data->length++] = (Trit)(j - 1);
+                    code = 0;
+                    code_len = 0;
+                    break;
+                }
+            }
+        }
+    }
+    return data->length == trit_count;
+}
+int decompress_t81z(const char* input_file, const char* output_file) {
+    FILE* f = fopen(input_file, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open input file %s\n", input_file);
+        return 0;
+    }
+    T81ZHeader header;
+    if (fread(&header, sizeof(T81ZHeader), 1, f) != 1 || strncmp(header.magic, "T81Z", 4) != 0) {
+        fprintf(stderr, "Invalid T81Z file\n");
+        fclose(f);
+        return 0;
+    }
+    uint8_t* buffer = malloc(header.original_length * 2);
+    if (!buffer) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(f);
+        return 0;
+    }
+    int buffer_length = fread(buffer, 1, header.original_length * 2, f);
+    fclose(f);
+    T81Data trit_data = { .data = malloc(header.original_length * sizeof(Trit)), .length = 0, .capacity = header.original_length };
+    if (!trit_data.data) {
+        fprintf(stderr, "Memory allocation failed\n");
+        free(buffer);
+        return 0;
+    }
+    int success = 0;
+    if (strncmp(header.method, "RLE", 4) == 0) {
+        success = rle_decompress(buffer, buffer_length, &trit_data);
+    } else if (strncmp(header.method, "HUF", 4) == 0) {
+        HuffmanTable table;
+        if (!build_huffman_table_from_header(&header, &table)) {
+            fprintf(stderr, "Failed to build Huffman table\n");
+            free(buffer);
+            free(trit_data.data);
+            return 0;
+        }
+        success = huffman_decompress(buffer, buffer_length, &trit_data, &table, header.original_length);
+    }
+    if (!success) {
+        fprintf(stderr, "Decompression failed\n");
+        free(buffer);
+        free(trit_data.data);
+        return 0;
+    }
+    if (compute_crc32(&trit_data) != header.crc32) {
+        fprintf(stderr, "CRC32 mismatch\n");
+        free(buffer);
+        free(trit_data.data);
+        return 0;
+    }
+    FILE* out = (output_file && strcmp(output_file, "-") != 0) ? fopen(output_file, "wb") : stdout;
+    if (!out) {
+        fprintf(stderr, "Error: Could not open output file %s\n", output_file ? output_file : "stdout");
+        free(buffer);
+        free(trit_data.data);
+        return 0;
+    }
+    success = trits_to_binary(&trit_data, header.chunk_size, out);
+    if (out != stdout) fclose(out);
+    free(buffer);
+    free(trit_data.data);
+    return success;
+}
+@1 Entropy Analysis
+@<Entropy Analysis@>=
+double entropy_score(const T81Data data) {
+    if (data->length <= 0) return 0.0;
+    int counts[TRIT_VALUES] = {0};
+    for (int i = 0; i < data->length; ++i) {
+        if (data->data[i] < -1 || data->data[i] > 1) {
+            fprintf(stderr, "Invalid trit: %d\n", data->data[i]);
+            return 0.0;
+        }
+        counts[data->data[i] + 1]++;
+    }
+    double score = 0.0;
+    for (int i = 0; i < TRIT_VALUES; ++i) {
+        if (counts[i] > 0) {
+            double p = counts[i] / (double)data->length;
+            score -= p * log2(p);
+        }
+    }
+    return score;
+}
+@1 Huffman Utilities
+@<Huffman Utilities@>=
+int code_matches(HuffmanCode code, int value, int len) {
+    for (int i = 0; i < len && i < code.length; ++i) {
+        if (((value >> (len - 1 - i)) & 1) != code.code[i]) return 0;
+    }
+    return len == code.length;
+}
+int build_huffman_table(const T81Data data, HuffmanTable* table) {
+    int counts[TRIT_VALUES] = {0};
+    for (int i = 0; i < data->length; ++i) {
+        if (data->data[i] < -1 || data->data[i] > 1) {
+            fprintf(stderr, "Invalid trit: %d\n", data->data[i]);
+            return 0;
+        }
+        counts[data->data[i] + 1]++;
+    }
+    int sorted[TRIT_VALUES] = {0, 1, 2};
+    for (int i = 0; i < TRIT_VALUES - 1; ++i) {
+        for (int j = i + 1; j < TRIT_VALUES; ++j) {
+            if (counts[sorted[j]] > counts[sorted[i]]) {
+                int temp = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = temp;
+            }
+        }
+    }
+    for (int i = 0; i < TRIT_VALUES; ++i) {
+        table->codes[i].length = 0;
+        memset(table->codes[i].code, 0, MAX_CODE_LENGTH);
+    }
+    table->codes[sorted[0]].length = 1;
+    table->codes[sorted[0]].code[0] = 0;
+    table->codes[sorted[1]].length = 2;
+    table->codes[sorted[1]].code[0] = 1;
+    table->codes[sorted[1]].code[1] = 0;
+    table->codes[sorted[2]].length = 2;
+    table->codes[sorted[2]].code[0] = 1;
+    table->codes[sorted[2]].code[1] = 1;
+    return 1;
+}
+int build_huffman_table_from_header(const T81ZHeader* header, HuffmanTable* table) {
+    for (int i = 0; i < TRIT_VALUES; ++i) {
+        table->codes[i].length = header->huff_table[i * (MAX_CODE_LENGTH + 1)];
+        for (int j = 0; j < table->codes[i].length; ++j) {
+            table->codes[i].code[j] = header->huff_table[i * (MAX_CODE_LENGTH + 1) + 1 + j];
+        }
+    }
+    return 1;
+}
+int huffman_compress(const T81Data* data, uint8_t* buffer, int* out_length, HuffmanTable* table) {
+    int bit_pos = 0;
+    *out_length = 0;
+    memset(buffer, 0, data->length * 2);
+    for (int i = 0; i < data->length; ++i) {
+        int idx = data->data[i] + 1;
+        if (idx < 0 || idx >= TRIT_VALUES) {
+            fprintf(stderr, "Invalid trit: %d\n", data->data[i]);
+            return 0;
+        }
+        for (int j = 0; j < table->codes[idx].length; ++j) {
+            if (bit_pos >= data->length * 16) {
+                fprintf(stderr, "Buffer overflow in Huffman compression\n");
+                return 0;
+            }
+            if (table->codes[idx].code[j]) {
+                buffer[bit_pos / 8] |= (1 << (7 - (bit_pos % 8)));
+            }
+            bit_pos++;
+        }
+    }
+    *out_length = (bit_pos + 7) / 8;
+    return 1;
+}
+@1 File Output Utilities
+@<File Output Utilities@>=
+uint32_t compute_crc32(const T81Data data) {
+    return crc32(0L, (const Bytef*)data->data, data->length * sizeof(Trit));
+}
+int write_compressed_file(const char* filename, const T81Data* data, const uint8_t* buffer, int buffer_length, const char* method, int chunk_size, HuffmanTable* huff_table) {
+    FILE* f = fopen(filename, "wb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open file for writing: %s\n", filename);
+        return 0;
+    }
+    T81ZHeader header = {
+        .magic = {'T', '8', '1', 'Z'},
+        .version = 1,
+        .original_length = (uint32_t)data->length,
+        .crc32 = compute_crc32(data),
+        .chunk_size = (uint8_t)chunk_size
+    };
+    strncpy(header.method, method, 4);
+    if (strcmp(method, "HUF") == 0) {
+        for (int i = 0; i < TRIT_VALUES; ++i) {
+            header.huff_table[i * (MAX_CODE_LENGTH + 1)] = huff_table->codes[i].length;
+            for (int j = 0; j < huff_table->codes[i].length; ++j) {
+                header.huff_table[i * (MAX_CODE_LENGTH + 1) + 1 + j] = huff_table->codes[i].code[j];
+            }
+        }
+    }
+    if (fwrite(&header, sizeof(T81ZHeader), 1, f) != 1) {
+        fprintf(stderr, "Error writing header\n");
+        fclose(f);
+        return 0;
+    }
+    if (fwrite(buffer, 1, buffer_length, f) != buffer_length) {
+        fprintf(stderr, "Error writing compressed data\n");
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+@1 Command-Line Parsing
+@<Command-Line Parsing@>=
+void print_usage(const char progname) {
+    fprintf(stderr, "Usage: %s [options]\n", progname);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --input <file>     Input file (or '-' for stdin)\n");
+    fprintf(stderr, "  --output <file>    Output file (default: output.t81z, or '-' for stdout)\n");
+    fprintf(stderr, "  --method <RLE|HUF> Compression method (default: HUF)\n");
+    fprintf(stderr, "  --chunk-size <4|5|6> Bits per trit group (default: 5)\n");
+    fprintf(stderr, "  --decompress       Decompress a T81Z file\n");
+    fprintf(stderr, "  --verify           Verify a T81Z file's integrity\n");
+    fprintf(stderr, "  --format <t81ascii|t81hex> Output trits in ASCII or hex (stdout only)\n");
+    fprintf(stderr, "  --test             Run unit tests\n");
+    fprintf(stderr, "  --help             Show this help message\n");
+}
+int parse_args(int argc, char* argv[], char** input_file, char** output_file, char** method, int* chunk_size, int* decompress, int* verify, char** format) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
+            *input_file = argv[++i];
+        } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+            *output_file = argv[++i];
+        } else if (strcmp(argv[i], "--method") == 0 && i + 1 < argc) {
+            *method = argv[++i];
+            if (strcmp(*method, "RLE") != 0 && strcmp(*method, "HUF") != 0) {
+                fprintf(stderr, "Invalid method: %s\n", *method);
+                return 0;
+            }
+        } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {
+            *chunk_size = atoi(argv[++i]);
+            if (*chunk_size != 4 && *chunk_size != 5 && *chunk_size != 6) {
+                fprintf(stderr, "Supported chunk sizes: 4, 5, 6\n");
+                return 0;
+            }
+        } else if (strcmp(argv[i], "--decompress") == 0) {
+            *decompress = 1;
+        } else if (strcmp(argv[i], "--verify") == 0) {
+            *verify = 1;
+        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            *format = argv[++i];
+            if (strcmp(*format, "t81ascii") != 0 && strcmp(*format, "t81hex") != 0) {
+                fprintf(stderr, "Invalid format: %s\n", *format);
+                return 0;
+            }
+        } else if (strcmp(argv[i], "--test") == 0) {
+            run_tests();
+            exit(0);
+        } else if (strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 0;
+        }
+    }
+    return 1;
+}
+@<Parse Command-Line Arguments@>=
+if (!parse_args(argc, argv, &input_file, &output_file, &method, &chunk_size, &decompress, &verify, &format)) {
+    return EXIT_USAGE;
+}
+@1 Utility Functions
+@<Utility Functions@>=
+int trits_to_binary(const T81Data trits, int chunk_size, FILE* out) {
+    int trit_count = (chunk_size == 4) ? 2 : (chunk_size == 5) ? 3 : 4;
+    const uint8_t (map)[trit_count] = (chunk_size == 4) ? bit_to_trit_map_4 :
+                                       (chunk_size == 5) ? bit_to_trit_map_5 : bit_to_trit_map_6;
+    int max_value = (chunk_size == 4) ? 9 : (chunk_size == 5) ? 27 : 81;
+    uint8_t binary = malloc(trits->length * chunk_size / 8 + 1);
+    int binary_length = 0, bit_pos = 0;
+    if (!binary) {
+        fprintf(stderr, "Memory allocation failed\n");
+        return 0;
+    }
+    for (int i = 0; i < trits->length; i += trit_count) {
+        uint8_t chunk[4];
+        int valid = 1;
+        for (int j = 0; j < trit_count && i + j < trits->length; ++j) {
+            chunk[j] = trits->data[i + j];
+            if (chunk[j] < -1 || chunk[j] > 1) valid = 0;
+        }
+        if (valid) {
+            for (int v = 0; v < max_value; ++v) {
+                int match = 1;
+                for (int j = 0; j < trit_count; ++j) {
+                    if (j < trit_count && map[v][j] != chunk[j]) {
+                        match = 0;
+                        break;
+                    }
+                }
+                if (match) {
+                    for (int j = chunk_size - 1; j >= 0; --j) {
+                        if (bit_pos / 8 >= trits->length * chunk_size / 8) {
+                            fprintf(stderr, "Buffer overflow\n");
+                            free(binary);
+                            return 0;
+                        }
+                        binary[bit_pos / 8] |= ((v >> j) & 1) << (7 - (bit_pos % 8));
+                        bit_pos++;
+                    }
+                    binary_length = bit_pos / 8 + (bit_pos % 8 ? 1 : 0);
+                    break;
+                }
+            }
+        }
+    }
+    if (fwrite(binary, 1, binary_length, out) != binary_length) {
+        fprintf(stderr, "Error writing binary output\n");
+        free(binary);
+        return 0;
+    }
+    free(binary);
+    return 1;
+}
+int verify_t81z(const char* input_file, const char* output_file) {
+    FILE* f = fopen(input_file, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open input file %s\n", input_file);
+        return 0;
+    }
+    T81ZHeader header;
+    if (fread(&header, sizeof(T81ZHeader), 1, f) != 1 || strncmp(header.magic, "T81Z", 4) != 0) {
+        fprintf(stderr, "Invalid T81Z file\n");
+        fclose(f);
+        return 0;
+    }
+    uint8_t* buffer = malloc(header.original_length * 2);
+    if (!buffer) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(f);
+        return 0;
+    }
+    int buffer_length = fread(buffer, 1, header.original_length * 2, f);
+    fclose(f);
+    T81Data trit_data = { .data = malloc(header.original_length * sizeof(Trit)), .length = 0, .capacity = header.original_length };
+    if (!trit_data.data) {
+        fprintf(stderr, "Memory allocation failed\n");
+        free(buffer);
+        return 0;
+    }
+    int success = 0;
+    if (strncmp(header.method, "RLE", 4) == 0) {
+        success = rle_decompress(buffer, buffer_length, &сию
+@<Decompression Routines@>=
+int rle_decompress(const uint8_t* buffer, int buffer_length, T81Data* data) {
+    data->length = 0;
+    for (int i = 0; i < buffer_length - 1; i += 2) {
+        Trit t = (Trit)buffer[i] - 1;
+        int run = buffer[i + 1];
+        if (data->length + run > data->capacity) {
+            data->capacity = (data->length + run) * 2;
+            Trit* temp = realloc(data->data, data->capacity * sizeof(Trit));
+            if (!temp) {
+                fprintf(stderr, "Memory reallocation failed\n");
+                return 0;
+            }
+            data->data = temp;
+        }
+        for (int j = 0; j < run; ++j) {
+            data->data[data->length++] = t;
+        }
+    }
+    return 1;
+}
+int huffman_decompress(const uint8_t* buffer, int buffer_length, T81Data* data, HuffmanTable* table, int trit_count) {
+    data->length = 0;
+    int bit_pos = 0;
+    while (bit_pos < buffer_length * 8 && data->length < trit_count) {
+        if (data->length >= data->capacity) {
+            data->capacity = 2;
+            Trit temp = realloc(data->data, data->capacity * sizeof(Trit));
+            if (!temp) {
+                fprintf(stderr, "Memory reallocation failed\n");
+                return 0;
+            }
+            data->data = temp;
+        }
+        int code = 0, code_len = 0;
+        for (int i = 0; i < MAX_CODE_LENGTH && bit_pos < buffer_length * 8; ++i) {
+            code = (code << 1) | ((buffer[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1);
+            code_len++;
+            bit_pos++;
+            for (int j = 0; j < TRIT_VALUES; ++j) {
+                if (table->codes[j].length == code_len && code_matches(table->codes[j], code, code_len)) {
+                    data->data[data->length++] = (Trit)(j - 1);
+                    code = 0;
+                    code_len = 0;
+                    break;
+                }
+            }
+        }
+    }
+    return data->length == trit_count;
+}
+int decompress_t81z(const char* input_file, const char* output_file) {
+    FILE* f = fopen(input_file, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open input file %s\n", input_file);
+        return 0;
+    }
+    T81ZHeader header;
+    if (fread(&header, sizeof(T81ZHeader), 1, f) != 1 || strncmp(header.magic, "T81Z", 4) != 0) {
+        fprintf(stderr, "Invalid T81Z file\n");
+        fclose(f);
+        return 0;
+    }
+    uint8_t* buffer = malloc(header.original_length * 2);
+    if (!buffer) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(f);
+        return 0;
+    }
+    int buffer_length = fread(buffer, 1, header.original_length * 2, f);
+    fclose(f);
+    T81Data trit_data = { .data = malloc(header.original_length * sizeof(Trit)), .length = 0, .capacity = header.original_length };
+    if (!trit_data.data) {
+        fprintf(stderr, "Memory allocation failed\n");
+        free(buffer);
+        return 0;
+    }
+    int success = 0;
+    if (strncmp(header.method, "RLE", 4) == 0) {
+        success = rle_decompress(buffer, buffer_length, &trit_data);
+    } else if (strncmp(header.method, "HUF", 4) == 0) {
+        HuffmanTable table;
+        if (!build_huffman_table_from_header(&header, &table)) {
+            fprintf(stderr, "Failed to build Huffman table\n");
+            free(buffer);
+            free(trit_data.data);
+            return 0;
+        }
+        success = huffman_decompress(buffer, buffer_length, &trit_data, &table, header.original_length);
+    }
+    if (!success) {
+        fprintf(stderr, "Decompression failed\n");
+        free(buffer);
+        free(trit_data.data);
+        return 0;
+    }
+    if (compute_crc32(&trit_data) != header.crc32) {
+        fprintf(stderr, "CRC32 mismatch\n");
+        free(buffer);
+        free(trit_data.data);
+        return 0;
+    }
+    FILE* out = (output_file && strcmp(output_file, "-") != 0) ? fopen(output_file, "wb") : stdout;
+    if (!out) {
+        fprintf(stderr, "Error: Could not open output file %s\n", output_file ? output_file : "stdout");
+        free(buffer);
+        free(trit_data.data);
+        return 0;
+    }
+    success = trits_to_binary(&trit_data, header.chunk_size, out);
+    if (out != stdout) fclose(out);
+    free(buffer);
+    free(trit_data.data);
+    return success;
+}
+@1 Entropy Analysis
+@<Entropy Analysis@>=
+double entropy_score(const T81Data data) {
+    if (data->length <= 0) return 0.0;
+    int counts[TRIT_VALUES] = {0};
+    for (int i = 0; i < data->length; ++i) {
+        if (data->data[i] < -1 || data->data[i] > 1) {
+            fprintf(stderr, "Invalid trit: %d\n", data->data[i]);
+            return 0.0;
+        }
+        counts[data->data[i] + 1]++;
+    }
+    double score = 0.0;
+    for (int i = 0; i < TRIT_VALUES; ++i) {
+        if (counts[i] > 0) {
+            double p = counts[i] / (double)data->length;
+            score -= p * log2(p);
+        }
+    }
+    return score;
+}
+@1 Huffman Utilities
+@<Huffman Utilities@>=
+int code_matches(HuffmanCode code, int value, int len) {
+    for (int i = 0; i < len && i < code.length; ++i) {
+        if (((value >> (len - 1 - i)) & 1) != code.code[i]) return 0;
+    }
+    return len == code.length;
+}
+int build_huffman_table(const T81Data data, HuffmanTable* table) {
+    int counts[TRIT_VALUES] = {0};
+    for (int i = 0; i < data->length; ++i) {
+        if (data->data[i] < -1 || data->data[i] > 1) {
+            fprintf(stderr, "Invalid trit: %d\n", data->data[i]);
+            return 0;
+        }
+        counts[data->data[i] + 1]++;
+    }
+    int sorted[TRIT_VALUES] = {0, 1, 2};
+    for (int i = 0; i < TRIT_VALUES - 1; ++i) {
+        for (int j = i + 1; j < TRIT_VALUES; ++j) {
+            if (counts[sorted[j]] > counts[sorted[i]]) {
+                int temp = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = temp;
+            }
+        }
+    }
+    for (int i = 0; i < TRIT_VALUES; ++i) {
+        table->codes[i].length = 0;
+        memset(table->codes[i].code, 0, MAX_CODE_LENGTH);
+    }
+    table->codes[sorted[0]].length = 1;
+    table->codes[sorted[0]].code[0] = 0;
+    table->codes[sorted[1]].length = 2;
+    table->codes[sorted[1]].code[0] = 1;
+    table->codes[sorted[1]].code[1] = 0;
+    table->codes[sorted[2]].length = 2;
+    table->codes[sorted[2]].code[0] = 1;
+    table->codes[sorted[2]].code[1] = 1;
+    return 1;
+}
+int build_huffman_table_from_header(const T81ZHeader* header, HuffmanTable* table) {
+    for (int i = 0; i < TRIT_VALUES; ++i) {
+        table->codes[i].length = header->huff_table[i * (MAX_CODE_LENGTH + 1)];
+        for (int j = 0; j < table->codes[i].length; ++j) {
+            table->codes[i].code[j] = header->huff_table[i * (MAX_CODE_LENGTH + 1) + 1 + j];
+        }
+    }
+    return 1;
+}
+int huffman_compress(const T81Data* data, uint8_t* buffer, int* out_length, HuffmanTable* table) {
+    int bit_pos = 0;
+    *out_length = 0;
+    memset(buffer, 0, data->length * 2);
+    for (int i = 0; i < data->length; ++i) {
+        int idx = data->data[i] + 1;
+        if (idx < 0 || idx >= TRIT_VALUES) {
+            fprintf(stderr, "Invalid trit: %d\n", data->data[i]);
+            return 0;
+        }
+        for (int j = 0; j < table->codes[idx].length; ++j) {
+            if (bit_pos >= data->length * 16) {
+                fprintf(stderr, "Buffer overflow in Huffman compression\n");
+                return 0;
+            }
+            if (table->codes[idx].code[j]) {
+                buffer[bit_pos / 8] |= (1 << (7 - (bit_pos % 8)));
+            }
+            bit_pos++;
+        }
+    }
+    *out_length = (bit_pos + 7) / 8;
+    return 1;
+}
+@1 File Output Utilities
+@<File Output Utilities@>=
+uint32_t compute_crc32(const T81Data data) {
+    return crc32(0L, (const Bytef*)data->data, data->length * sizeof(Trit));
+}
+int write_compressed_file(const char* filename, const T81Data* data, const uint8_t* buffer, int buffer_length, const char* method, int chunk_size, HuffmanTable* huff_table) {
+    FILE* f = fopen(filename, "wb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open file for writing: %s\n", filename);
+        return 0;
+    }
+    T81ZHeader header = {
+        .magic = {'T', '8', '1', 'Z'},
+        .version = 1,
+        .original_length = (uint32_t)data->length,
+        .crc32 = compute_crc32(data),
+        .chunk_size = (uint8_t)chunk_size
+    };
+    strncpy(header.method, method, 4);
+    if (strcmp(method, "HUF") == 0) {
+        for (int i = 0; i < TRIT_VALUES; ++i) {
+            header.huff_table[i * (MAX_CODE_LENGTH + 1)] = huff_table->codes[i].length;
+            for (int j = 0; j < huff_table->codes[i].length; ++j) {
+                header.huff_table[i * (MAX_CODE_LENGTH + 1) + 1 + j] = huff_table->codes[i].code[j];
+            }
+        }
+    }
+    if (fwrite(&header, sizeof(T81ZHeader), 1, f) != 1) {
+        fprintf(stderr, "Error writing header\n");
+        fclose(f);
+        return 0;
+    }
+    if (fwrite(buffer, 1, buffer_length, f) != buffer_length) {
+        fprintf(stderr, "Error writing compressed data\n");
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+@1 Command-Line Parsing
+@<Command-Line Parsing@>=
+void print_usage(const char progname) {
+    fprintf(stderr, "Usage: %s [options]\n", progname);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --input <file>     Input file (or '-' for stdin)\n");
+    fprintf(stderr, "  --output <file>    Output file (default: output.t81z, or '-' for stdout)\n");
+    fprintf(stderr, "  --method <RLE|HUF> Compression method (default: HUF)\n");
+    fprintf(stderr, "  --chunk-size <4|5|6> Bits per trit group (default: 5)\n");
+    fprintf(stderr, "  --decompress       Decompress a T81Z file\n");
+    fprintf(stderr, "  --verify           Verify a T81Z file's integrity\n");
+    fprintf(stderr, "  --format <t81ascii|t81hex> Output trits in ASCII or hex (stdout only)\n");
+    fprintf(stderr, "  --test             Run unit tests\n");
+    fprintf(stderr, "  --help             Show this help message\n");
+}
+int parse_args(int argc, char* argv[], char** input_file, char** output_file, char** method, int* chunk_size, int* decompress, int* verify, char** format) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
+            *input_file = argv[++i];
+        } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+            *output_file = argv[++i];
+        } else if (strcmp(argv[i], "--method") == 0 && i + 1 < argc) {
+            *method = argv[++i];
+            if (strcmp(*method, "RLE") != 0 && strcmp(*method, "HUF") != 0) {
+                fprintf(stderr, "Invalid method: %s\n", *method);
+                return 0;
+            }
+        } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {
+            *chunk_size = atoi(argv[++i]);
+            if (*chunk_size != 4 && *chunk_size != 5 && *chunk_size != 6) {
+                fprintf(stderr, "Supported chunk sizes: 4, 5, 6\n");
+                return 0;
+            }
+        } else if (strcmp(argv[i], "--decompress") == 0) {
+            *decompress = 1;
+        } else if (strcmp(argv[i], "--verify") == 0) {
+            *verify = 1;
+        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            *format = argv[++i];
+            if (strcmp(*format, "t81ascii") != 0 && strcmp(*format, "t81hex") != 0) {
+                fprintf(stderr, "Invalid format: %s\n", *format);
+                return 0;
+            }
+        } else if (strcmp(argv[i], "--test") == 0) {
+            run_tests();
+            exit(0);
+        } else if (strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 0;
+        }
+    }
+    return 1;
+}
+@<Parse Command-Line Arguments@>=
+if (!parse_args(argc, argv, &input_file, &output_file, &method, &chunk_size, &decompress, &verify, &format)) {
+    return EXIT_USAGE;
+}
+@1 Utility Functions
+@<Utility Functions@>=
+int trits_to_binary(const T81Data trits, int chunk_size, FILE* out) {
+    int trit_count = (chunk_size == 4) ? 2 : (chunk_size == 5) ? 3 : 4;
+    const uint8_t (map)[trit_count] = (chunk_size == 4) ? bit_to_trit_map_4 :
+                                       (chunk_size == 5) ? bit_to_trit_map_5 : bit_to_trit_map_6;
+    int max_value = (chunk_size == 4) ? 9 : (chunk_size == 5) ? 27 : 81;
+    uint8_t binary = malloc(trits->length * chunk_size / 8 + 1);
+    int binary_length = 0, bit_pos = 0;
+    if (!binary) {
+        fprintf(stderr, "Memory allocation failed\n");
+        return 0;
+    }
+    for (int i = 0; i < trits->length; i += trit_count) {
+        uint8_t chunk[4];
+        int valid = 1;
+        for (int j = 0; j < trit_count && i + j < trits->length; ++j) {
+            chunk[j] = trits->data[i + j];
+            if (chunk[j] < -1 || chunk[j] > 1) valid = 0;
+        }
+        if (valid) {
+            for (int v = 0; v < max_value; ++v) {
+                int match = 1;
+                for (int j = 0; j < trit_count; ++j) {
+                    if (j < trit_count && map[v][j] != chunk[j]) {
+                        match = 0;
+                        break;
+                    }
+                }
+                if (match) {
+                    for (int j = chunk_size - 1; j >= 0; --j) {
+                        if (bit_pos / 8 >= trits->length * chunk_size / 8) {
+                            fprintf(stderr, "Buffer overflow\n");
+                            free(binary);
+                            return 0;
+                        }
+                        binary[bit_pos / 8] |= ((v >> j) & 1) << (7 - (bit_pos % 8));
+                        bit_pos++;
+                    }
+                    binary_length = bit_pos / 8 + (bit_pos % 8 ? 1 : 0);
+                    break;
+                }
+            }
+        }
+    }
+    if (fwrite(binary, 1, binary_length, out) != binary_length) {
+        fprintf(stderr, "Error writing binary output\n");
+        free(binary);
+        return 0;
+    }
+    free(binary);
+    return 1;
+}
+int verify_t81z(const char* input_file, const char* output_file) {
+    FILE* f = fopen(input_file, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open input file %s\n", input_file);
+        return 0;
+    }
+    T81ZHeader header;
+    if (fread(&header, sizeof(T81ZHeader), 1, f) != 1 || strncmp(header.magic, "T81Z", 4) != 0) {
+        fprintf(stderr, "Invalid T81Z file\n");
+        fclose(f);
+        return 0;
+    }
+    uint8_t* buffer = malloc(header.original_length * 2);
+    if (!buffer) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(f);
+        return 0;
+    }
+    int buffer_length = fread(buffer, 1, header.original_length * 2, f);
+    fclose(f);
+    T81Data trit_data = { .data = malloc(header.original_length * sizeof(Trit)), .length = 0, .capacity = header.original_length };
+    if (!trit_data.data) {
+        fprintf(stderr, "Memory allocation failed\n");
+        free(buffer);
+        return 0;
+    }
+    int success = 0;
+    if (strncmp(header.method, "RLE", 4) == 0) {
+        success = rle_decompress(buffer, buffer_length, &trit_data);
+    } else if (strncmp(header.method, "HUF", 4) == 0) {
+        HuffmanTable table;
+        if (!build_huffman_table_from_header(&header, &table)) {
+            free(buffer);
+            free(trit_data.data);
+            return 0;
+        }
+        success = huffman_decompress(buffer, buffer_length, &trit_data, &table, header.original_length);
+    }
+    free(buffer);
+    if (!success) {
+        fprintf(stderr, "Decompression failed\n");
+        free(trit_data.data);
+        return 0;
+    }
+    uint32_t computed_crc = compute_crc32(&trit_data);
+    free(trit_data.data);
+    if (computed_crc != header.crc32) {
+        fprintf(stderr, "CRC32 mismatch: expected %u, got %u\n", header.crc32, computed_crc);
+        return 0;
+    }
+    printf("Verification successful: CRC32 matches\n");
+    return 1;
+}
+@1 Format Handlers
+@<Format Handlers@>=
+int format_t81ascii(const T81Data trits, FILE* out) {
+    for (int i = 0; i < trits->length; ++i) {
+        char c = (trits->data[i] == -1) ? '-' : (trits->data[i] == 0) ? '0' : '+';
+        if (fputc(c, out) == EOF) {
+            fprintf(stderr, "Error writing ASCII output\n");
+            return 0;
+        }
+    }
+    fputc('\n', out);
+    return 1;
+}
+int format_t81hex(const T81Data* trits, FILE* out) {
+    for (int i = 0; i < trits->length; ++i) {
+        char* hex = (trits->data[i] == -1) ? "00" : (trits->data[i] == 0) ? "01" : "10";
+        if (fputs(hex, out) == EOF) {
+            fprintf(stderr, "Error writing hex output\n");
+            return 0;
+        }
+    }
+    fputc('\n', out);
+    return 1;
+}
+@1 Testing Utilities
+@<Testing Utilities@>=
+#include <assert.h>
+void test_binary_to_trits() {
+    uint8_t binary[] = {0b10110}; // 5 bits: 10110 -> map to (-1, 0, 1)
+    T81Data trits = { .data = malloc(10 * sizeof(Trit)), .length = 0, .capacity = 10 };
+    assert(binary_to_trits(binary, 1, &trits, 5));
+    assert(trits.length == 3);
+    assert(trits.data[0] == -1 && trits.data[1] == 0 && trits.data[2] == 1);
+    free(trits.data);
+    printf("Test binary_to_trits passed\n");
+}
+void test_rle_compress_decompress() {
+    T81Data trits = { .data = malloc(10 * sizeof(Trit)), .length = 6, .capacity = 10 };
+    trits.data[0] = -1; trits.data[1] = -1; trits.data[2] = 0; trits.data[3] = 0; trits.data[4] = 0; trits.data[5] = 1;
+    uint8_t buffer[20];
+    int buffer_length;
+    assert(rle_compress(&trits, buffer, &buffer_length));
+    T81Data decompressed = { .data = malloc(10 * sizeof(Trit)), .length = 0, .capacity = 10 };
+    assert(rle_decompress(buffer, buffer_length, &decompressed));
+    assert(decompressed.length == trits.length);
+    for (int i = 0; i < trits.length; ++i) assert(decompressed.data[i] == trits.data[i]);
+    free(trits.data);
+    free(decompressed.data);
+    printf("Test rle_compress_decompress passed\n");
+}
+void test_huffman_compress_decompress() {
+    T81Data trits = { .data = malloc(10 * sizeof(Trit)), .length = 6, .capacity = 10 };
+    trits.data[0] = -1; trits.data[1] = 0; trits.data[2] = 0; trits.data[3] = 0; trits.data[4] = 1; trits.data[5] = 1;
+    HuffmanTable table;
+    assert(build_huffman_table(&trits, &table));
+    uint8_t buffer[20];
+    int buffer_length;
+    assert(huffman_compress(&trits, buffer, &buffer_length, &table));
+    T81Data decompressed = { .data = malloc(10 * sizeof(Trit)), .length = 0, .capacity = 10 };
+    assert(huffman_decompress(buffer, buffer_length, &decompressed, &table, trits.length));
+    assert(decompressed.length == trits.length);
+    for (int i = 0; i < trits.length; ++i) assert(decompressed.data[i] == trits.data[i]);
+    free(trits.data);
+    free(decompressed.data);
+    printf("Test huffman_compress_decompress passed\n");
+}
+void test_format_handlers() {
+    T81Data trits = { .data = malloc(10 * sizeof(Trit)), .length = 3, .capacity = 10 };
+    trits.data[0] = -1; trits.data[1] = 0; trits.data[2] = 1;
+    FILE out = tmpfile();
+    assert(format_t81ascii(&trits, out));
+    rewind(out);
+    char buf[10];
+    assert(fgets(buf, 10, out) && strcmp(buf, "-0+\n") == 0);
+    rewind(out);
+    assert(format_t81hex(&trits, out));
+    rewind(out);
+    assert(fgets(buf, 10, out) && strcmp(buf, "000110\n") == 0);
+    fclose(out);
+    free(trits.data);
+    printf("Test format_handlers passed\n");
+}
+void run_tests() {
+    test_binary_to_trits();
+    test_rle_compress_decompress();
+    test_huffman_compress_decompress();
+    test_format_handlers();
+    printf("All tests passed\n");
+}

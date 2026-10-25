@@ -1,0 +1,236 @@
+@* Grok API Bridge for Axion AI.
+This module implements a ZeroMQ-based bridge to connect Grok 3's NLP queries to
+the Axion AI kernel module via the AxionCLI userspace tool. It receives JSON queries,
+compiles them using the TISC (Ternary Instruction Set Compiler), executes them through
+AxionCLI, and returns JSON results. The bridge listens on a ZeroMQ REP socket
+(e.g., `tcp://*:5555`) and supports commands like `tadd`, `optimize`, and `viz`.
+
+@s zmq_t int
+@s json_t int
+@s json_object int
+
+@*1 Dependencies.
+Includes ZeroMQ for communication, json-c for JSON parsing, and axioncli.h for
+interfacing with the AxionCLI tool. Also includes standard C libraries for logging
+and signal handling.
+@c
+#include <zmq.h>
+#include <json-c/json.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <syslog.h>
+#include <signal.h>
+#include <unistd.h>
+#include "axioncli.h"
+
+@*1 Global State.
+Stores the ZeroMQ context and socket, and a flag for graceful shutdown.
+@c
+static void *context = NULL;
+static void *socket = NULL;
+static volatile sig_atomic_t running = 1;
+
+@*1 Signal Handler.
+Handles SIGINT and SIGTERM to gracefully shut down the bridge.
+@c
+static void signal_handler(int sig) {
+    running = 0;
+    syslog(LOG_INFO, "Grok bridge: Received signal %d, shutting down", sig);
+}
+
+@*1 Bridge Initialization.
+Initializes the ZeroMQ context and REP socket, binding to the specified endpoint.
+Returns the socket on success, or NULL on failure.
+@c
+void *grok_bridge_init(const char *endpoint) {
+    context = zmq_ctx_new();
+    if (!context) {
+        syslog(LOG_ERR, "Grok bridge: Failed to create ZeroMQ context");
+        return NULL;
+    }
+
+    socket = zmq_socket(context, ZMQ_REP);
+    if (!socket) {
+        syslog(LOG_ERR, "Grok bridge: Failed to create ZeroMQ socket");
+        zmq_ctx_destroy(context);
+        return NULL;
+    }
+
+    if (zmq_bind(socket, endpoint) != 0) {
+        syslog(LOG_ERR, "Grok bridge: Failed to bind to %s", endpoint);
+        zmq_close(socket);
+        zmq_ctx_destroy(context);
+        return NULL;
+    }
+
+    syslog(LOG_INFO, "Grok bridge: Initialized on %s", endpoint);
+    return socket;
+}
+
+@*1 Process Query.
+Receives a JSON query via ZeroMQ, parses it, executes it via AxionCLI, and returns
+a JSON result. Returns NULL on error, with an error message in the JSON response.
+@c
+json_object *grok_bridge_process(void *socket) {
+    zmq_msg_t msg;
+    json_object *query = NULL;
+    json_object *result = json_object_new_object();
+    char *query_str = NULL;
+
+    if (zmq_msg_init(&msg) != 0) {
+        syslog(LOG_ERR, "Grok bridge: Failed to initialize ZeroMQ message");
+        json_object_put(result);
+        return NULL;
+    }
+
+    if (zmq_msg_recv(&msg, socket, 0) == -1) {
+        syslog(LOG_ERR, "Grok bridge: Failed to receive message");
+        zmq_msg_close(&msg);
+        json_object_put(result);
+        return NULL;
+    }
+
+    query_str = strndup(zmq_msg_data(&msg), zmq_msg_size(&msg));
+    if (!query_str) {
+        syslog(LOG_ERR, "Grok bridge: Failed to allocate query string");
+        zmq_msg_close(&msg);
+        json_object_put(result);
+        return NULL;
+    }
+
+    query = json_tokener_parse(query_str);
+    if (!query) {
+        syslog(LOG_ERR, "Grok bridge: Invalid JSON query: %s", query_str);
+        json_object_object_add(result, "error", json_object_new_string("Invalid JSON"));
+        free(query_str);
+        zmq_msg_close(&msg);
+        return result;
+    }
+
+    // Extract query type and value
+    json_object *type_obj, *value_obj;
+    const char *type, *value;
+    if (!json_object_object_get_ex(query, "type", &type_obj) ||
+        !json_object_object_get_ex(query, "value", &value_obj)) {
+        syslog(LOG_ERR, "Grok bridge: Missing type or value in query: %s", query_str);
+        json_object_object_add(result, "error", json_object_new_string("Missing type or value"));
+        free(query_str);
+        zmq_msg_close(&msg);
+        json_object_put(query);
+        return result;
+    }
+
+    type = json_object_get_string(type_obj);
+    value = json_object_get_string(value_obj);
+    syslog(LOG_INFO, "Grok bridge: Processing query: type=%s, value=%s", type, value);
+
+    // Execute via AxionCLI
+    if (strcmp(type, "cmd") == 0) {
+        json_object *cli_result = axioncli_execute_tisc(value);
+        if (cli_result) {
+            json_object_object_add(result, "result", cli_result);
+        } else {
+            json_object_object_add(result, "error", json_object_new_string("Execution failed"));
+        }
+    } else if (strcmp(type, "viz") == 0) {
+        json_object *viz_result = axioncli_visualize();
+        if (viz_result) {
+            json_object_object_add(result, "result", viz_result);
+        } else {
+            json_object_object_add(result, "error", json_object_new_string("Visualization failed"));
+        }
+    } else {
+        json_object_object_add(result, "error", json_object_new_string("Unsupported query type"));
+    }
+
+    free(query_str);
+    zmq_msg_close(&msg);
+    json_object_put(query);
+    return result;
+}
+
+@*1 AxionCLI Interface.
+Stub for axioncli_execute_tisc and axioncli_visualize, to be implemented in axioncli.c.
+@c
+json_object *axioncli_execute_tisc(const char *query) {
+    // Placeholder: Execute TISC query via axionctl
+    // Example: axionctl tadd 0 1 2 or axionctl optimize
+    json_object *result = json_object_new_object();
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "axionctl %s", query);
+    // Execute command and parse output
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        json_object_object_add(result, "error", json_object_new_string("Failed to execute command"));
+        return result;
+    }
+    char output[1024] = {0};
+    fread(output, 1, sizeof(output) - 1, fp);
+    pclose(fp);
+    json_object_object_add(result, "output", json_object_new_string(output));
+    return result;
+}
+
+json_object *axioncli_visualize(void) {
+    // Placeholder: Retrieve visualization via axionctl viz --json
+    json_object *result = json_object_new_object();
+    FILE *fp = popen("axionctl viz --json", "r");
+    if (!fp) {
+        json_object_object_add(result, "error", json_object_new_string("Failed to retrieve visualization"));
+        return result;
+    }
+    char output[8192] = {0};
+    fread(output, 1, sizeof(output) - 1, fp);
+    pclose(fp);
+    json_object *viz = json_tokener_parse(output);
+    if (viz) {
+        json_object_object_add(result, "visualization", viz);
+    } else {
+        json_object_object_add(result, "error", json_object_new_string("Invalid visualization JSON"));
+    }
+    return result;
+}
+
+@*1 Main Loop.
+Runs the bridge server, processing queries until interrupted. Includes signal
+handling for graceful shutdown.
+@c
+int main() {
+    openlog("grok_bridge", LOG_PID, LOG_DAEMON);
+    syslog(LOG_INFO, "Grok bridge: Starting");
+
+    // Setup signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    socket = grok_bridge_init("tcp://*:5555");
+    if (!socket) {
+        syslog(LOG_ERR, "Grok bridge: Initialization failed");
+        closelog();
+        return 1;
+    }
+
+    while (running) {
+        json_object *result = grok_bridge_process(socket);
+        if (!result) {
+            syslog(LOG_ERR, "Grok bridge: Failed to process query");
+            continue;
+        }
+
+        const char *response = json_object_to_json_string_ext(result, JSON_C_TO_STRING_PLAIN);
+        if (response) {
+            zmq_send(socket, response, strlen(response), 0);
+        } else {
+            syslog(LOG_ERR, "Grok bridge: Failed to serialize response");
+        }
+
+        json_object_put(result);
+    }
+
+    syslog(LOG_INFO, "Grok bridge: Shutting down");
+    zmq_close(socket);
+    zmq_ctx_destroy(context);
+    closelog();
+    return 0;
+}

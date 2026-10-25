@@ -1,0 +1,181 @@
+@* entropy_monitor.cweb | HanoiVM Entropy Monitoring Daemon (v0.9.3)
+
+This module monitors entropy drift in the `τ[27]` symbolic tier, triggers Axion AI rollbacks,
+and publishes results via debugfs at `/sys/kernel/debug/entropy-monitor`. It complements
+`recursion_exporter.cweb` and `symbolic_trace.cweb`, integrating with `hanoivm_fsm.v` via PCIe/M.2,
+`axion-ai.cweb` via ioctls/debugfs, `hanoivm-core.cweb` and `hanoivm-runtime.cweb` via FFI,
+`hanoivm_vm.cweb`’s execution core, `hanoivm_firmware.cweb`’s firmware, `axion-gaia-interface.cweb`’s
+GPU dispatch, `axion_api.cweb`’s recursion optimization, `axion_gpu_serializer.cweb`’s GPU serialization,
+`bootstrap.cweb`’s bootstrap sequence, `config.cweb`’s configuration, `cuda_handle_request.cweb`’s CUDA backend,
+`disasm_hvm.cweb`’s type-aware disassembly, `disassembler.cweb`’s advanced disassembly,
+`emit_hvm.cweb`’s bytecode emission, and `advanced_ops.cweb`/`advanced_ops_ext.cweb` opcodes.
+
+Enhancements:
+- T81/T729 entropy metrics from `advanced_ops.cweb` and `advanced_ops_ext.cweb`.
+- Session-aware entropy logging with `axion-ai.cweb`’s `axion_session_t`.
+- Configurable thresholds via `config.cweb` and ioctls.
+- Hardware integration with `hanoivm_firmware.cweb` and `hanoivm_fsm.v`.
+- Extended logging to `axion-ai.cweb`’s `/sys/kernel/debug/axion-ai/entropy_log`.
+- FFI interface to `hanoivm-core.cweb` (Rust) and `hanoivm-runtime.cweb` (C).
+- Secure validation for entropy data and rollback triggers.
+- JSON visualization for entropy logs.
+- Support for `.hvm` test bytecode (`T81_MATMUL` + `TNN_ACCUM`).
+- Optimized for ternary entropy monitoring.
+
+@c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/debugfs.h>
+#include <linux/uaccess.h>
+#include <linux/slab.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/timekeeping.h>
+#include <linux/ioctl.h>
+#include "axion_api.h"
+#include "hanoivm_stack.h"
+#include "axion-ai.h"
+#include "hanoivm_core.h"
+#include "hanoivm_runtime.h"
+#include "axion-gaia-interface.h"
+
+#define ENTROPY_THRESHOLD_DEFAULT 81
+#define ENTROPY_MONITOR_INTERVAL_MS 500
+#define MONITOR_NODE "entropy-monitor"
+#define MAX_LOG_MSG 256
+
+@<Global State@>=
+static struct timer_list entropy_timer;
+static struct dentry *entropy_debug_node;
+static char entropy_log[MAX_LOG_MSG];
+static int entropy_threshold = ENTROPY_THRESHOLD_DEFAULT;
+static int last_entropy = 0;
+static ktime_t last_event_tick;
+static char session_id[32];
+
+@<IOCTL Definitions@>=
+#define ENTROPY_IOC_MAGIC 'E'
+#define ENTROPY_IOC_SET_THRESHOLD _IOW(ENTROPY_IOC_MAGIC, 1, int)
+#define ENTROPY_IOC_GET_THRESHOLD _IOR(ENTROPY_IOC_MAGIC, 2, int)
+
+@<Entropy Analysis Function@>=
+int analyze_entropy(void) {
+    int current_entropy = get_entropy_tau27();
+    extern int rust_validate_entropy(int entropy);
+    if (!rust_validate_entropy(current_entropy)) {
+        axion_log_entropy("ENTROPY_INVALID", current_entropy);
+        return -EINVAL;
+    }
+    int delta = current_entropy - last_entropy;
+    GaiaRequest req = { .tbin = (uint8_t*)&current_entropy, .tbin_len = sizeof(int), .intent = GAIA_T729_DOT };
+    GaiaResponse res = cuda_handle_request(req);
+    if (res.symbolic_status == 0 && res.entropy_delta != 0) {
+        delta += res.entropy_delta;
+    }
+    last_entropy = current_entropy;
+    axion_log_entropy("ENTROPY_DELTA", delta);
+    return delta;
+}
+
+@<Entropy Monitor Timer Callback@>=
+void entropy_check(struct timer_list *t) {
+    int delta = analyze_entropy();
+    last_event_tick = ktime_get();
+    if (abs(delta) > entropy_threshold) {
+        snprintf(entropy_log, sizeof(entropy_log),
+                 "[Entropy Alert] Δτ[27] = %d @ %llu ns, Session: %s\n",
+                 delta, ktime_to_ns(last_event_tick), session_id);
+        axion_trigger_rollback("entropy_spike");
+        axion_log_entropy("ENTROPY_ROLLBACK", delta);
+    } else {
+        snprintf(entropy_log, sizeof(entropy_log),
+                 "[Entropy OK] Δτ[27] = %d @ %llu ns, Session: %s\n",
+                 delta, ktime_to_ns(last_event_tick), session_id);
+    }
+    mod_timer(&entropy_timer, jiffies + msecs_to_jiffies(ENTROPY_MONITOR_INTERVAL_MS));
+}
+
+@<DebugFS Read Interface@>=
+static ssize_t entropy_read(struct file *file, char __user *ubuf, size_t count, loff_t *ppos) {
+    size_t len = strlen(entropy_log);
+    if (*ppos > 0 || count < len) return 0;
+    if (copy_to_user(ubuf, entropy_log, len)) return -EFAULT;
+    *ppos = len;
+    return len;
+}
+
+@<IOCTL Handler@>=
+static long entropy_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    switch (cmd) {
+        case ENTROPY_IOC_SET_THRESHOLD: {
+            int threshold;
+            if (copy_from_user(&threshold, (int __user *)arg, sizeof(int)))
+                return -EFAULT;
+            if (threshold < 0 || threshold > 1000)
+                return -EINVAL;
+            entropy_threshold = threshold;
+            axion_log_entropy("ENTROPY_THRESHOLD_SET", threshold);
+            return 0;
+        }
+        case ENTROPY_IOC_GET_THRESHOLD: {
+            if (copy_to_user((int __user *)arg, &entropy_threshold, sizeof(int)))
+                return -EFAULT;
+            return 0;
+        }
+        default:
+            return -ENOTTY;
+    }
+}
+
+static const struct file_operations entropy_fops = {
+    .owner = THIS_MODULE,
+    .read = entropy_read,
+    .unlocked_ioctl = entropy_ioctl,
+    .compat_ioctl = entropy_ioctl
+};
+
+@<Visualization Hook@>=
+void entropy_visualize(char* out_json, size_t max_len) {
+    size_t len = snprintf(out_json, max_len,
+                          "{\"session\": \"%s\", \"last_entropy\": %d, \"threshold\": %d, \"log\": \"%s\"}",
+                          session_id, last_entropy, entropy_threshold, entropy_log);
+    axion_log_entropy("ENTROPY_VISUALIZE", len & 0xFF);
+}
+
+@<Integration Hook@>=
+void entropy_integrate(const char* sid) {
+    snprintf(session_id, sizeof(session_id), "%s", sid ? sid : "ENTROPY_DEFAULT");
+    axion_register_session(session_id);
+    char json[512];
+    entropy_visualize(json, sizeof(json));
+    GaiaRequest req = { .tbin = (uint8_t*)json, .tbin_len = strlen(json), .intent = GAIA_T729_DOT };
+    GaiaResponse res = cuda_handle_request(req);
+    axion_log_entropy("ENTROPY_INTEGRATE_CUDA", res.symbolic_status);
+}
+
+@<Module Init / Exit@>=
+static int __init entropy_monitor_init(void) {
+    pr_info("[entropy-monitor] Initializing\n");
+    entropy_debug_node = debugfs_create_file(MONITOR_NODE, 0644, NULL, NULL, &entropy_fops);
+    if (IS_ERR(entropy_debug_node)) {
+        pr_err("[entropy-monitor] Failed to create debugfs node\n");
+        return PTR_ERR(entropy_debug_node);
+    }
+    timer_setup(&entropy_timer, entropy_check, 0);
+    mod_timer(&entropy_timer, jiffies + msecs_to_jiffies(ENTROPY_MONITOR_INTERVAL_MS));
+    entropy_integrate("INIT_SESSION");
+    return 0;
+}
+
+static void __exit entropy_monitor_exit(void) {
+    debugfs_remove(entropy_debug_node);
+    del_timer_sync(&entropy_timer);
+    pr_info("[entropy-monitor] Shutdown\n");
+}
+
+module_init(entropy_monitor_init);
+module_exit(entropy_monitor_exit);
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("Axion + HanoiVM Team");
+MODULE_DESCRIPTION("Entropy monitor with Axion rollback for symbolic tier integrity");

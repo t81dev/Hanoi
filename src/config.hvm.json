@@ -1,0 +1,35 @@
+{
+    "version": "0.9",
+    "hardware": {
+        "enable_pcie_acceleration": true,
+        "enable_gpu_support": true,
+        "enable_dynamic_resource_scaling": true
+    },
+    "ai": {
+        "optimization_mode": "Advanced",
+        "enable_anomaly_detection": true,
+        "enable_ai_log_feedback": true,
+        "symbolic_threshold": 0,
+        "enable_axion_core": true
+    },
+    "logging": {
+        "log_level": "INFO",
+        "log_output_format": "TEXT",
+        "enable_secure_mode": true
+    },
+    "resources": {
+        "memory_allocation_mb": 4096,
+        "cpu_affinity": "0,1,2,3",
+        "gpu_allocation_mb": 4096,
+        "enable_runtime_overrides": true
+    },
+    "environment": {
+        "detect_gpu": true,
+        "detect_pcie_accelerator": true
+    },
+    "global": {
+        "ternary_logic_mode": "T81",
+        "enable_adaptive_mode_switching": true,
+        "enable_debug_mode": true
+    }
+}

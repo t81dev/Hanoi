@@ -1,0 +1,403 @@
+@* Ternary Decryption Tool for T81Z Ciphertexts *@
+This program decrypts ternary ciphertexts stored in the T81Z file format, produced by t81_cipher_suite.cweb. It supports RLE or Huffman-compressed ciphertexts, decrypts using REFC, AECS, RTPE, or TRTSC ciphers, and validates the result with CRC32. It accepts binary or trit-based keys and provides command-line options for flexibility.
+@c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <openssl/sha.h>
+#define MAX_TRITS 1024
+#define MAX_KEY_SIZE 128
+#define TRIT_VALUES 3
+#define MAX_CODE_LENGTH 8
+typedef int8_t Trit;
+typedef struct {
+    Trit trits[MAX_TRITS];
+    int length;
+} T81TritBuffer;
+typedef struct {
+    char magic[4];
+    uint8_t version;
+    uint16_t original_length;
+    char method[4];
+    uint32_t crc32;
+} T81ZHeader;
+typedef struct {
+    uint8_t code[MAX_CODE_LENGTH];
+    int length;
+} HuffmanCode;
+typedef struct {
+    HuffmanCode codes[TRIT_VALUES];
+} HuffmanTable;
+@<Ternary Utilities@>
+@<Key Scheduling@>
+@<Cipher Decryptors@>
+@<File Input and Parsing@>
+@<Decompression Routines@>
+@<Validation and Output@>
+int main(int argc, char* argv[]) {
+    char* ciphertext_file = NULL;
+    char* key_file = NULL;
+    char* output_file = NULL;
+    int verbose = 0;
+    int key_is_binary = 1;
+
+// Parse command-line arguments
+for (int i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--ciphertext") == 0 && i + 1 < argc) {
+        ciphertext_file = argv[++i];
+    } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
+        key_file = argv[++i];
+    } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+        output_file = argv[++i];
+    } else if (strcmp(argv[i], "--verbose") == 0) {
+        verbose = 1;
+    } else if (strcmp(argv[i], "--key-format") == 0 && i + 1 < argc) {
+        if (strcmp(argv[++i], "trit") == 0) key_is_binary = 0;
+        else if (strcmp(argv[i], "binary") != 0) {
+            fprintf(stderr, "Invalid key format\n");
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "Usage: %s --ciphertext <file> --key <file> [--output <file>] [--verbose] [--key-format binary|trit]\n", argv[0]);
+        return 1;
+    }
+}
+if (!ciphertext_file || !key_file) {
+    fprintf(stderr, "Missing required arguments\n");
+    return 1;
+}
+
+// Load key
+T81TritBuffer key;
+@<Load Key from File@>
+
+// Load ciphertext and header
+T81ZHeader header;
+uint8_t compressed_data[MAX_TRITS];
+int compressed_length;
+@<Load Ciphertext and Header@>
+
+// Decompress
+T81TritBuffer ciphertext;
+@<Decompress Based on Header@>
+
+// Derive key
+T81TritBuffer derived_key;
+derive_key(&key, &derived_key, header.original_length);
+
+// Decrypt
+T81TritBuffer decrypted;
+clock_t start = clock();
+@<Select and Run Decryption@>
+
+// Validate
+double entropy = 0.0;
+int valid = 0;
+@<Validate Decryption@>
+
+// Output
+double time_taken = (double)(clock() - start) / CLOCKS_PER_SEC;
+@<Output Result@>
+
+return 0;
+
+}
+@1 Ternary Utilities
+@<Ternary Utilities@>=
+void print_trits(const char label, const T81TritBuffer* buf) {
+    printf("%s: ", label);
+    for (int i = 0; i < buf->length; ++i) {
+        if (buf->trits[i] < -1 || buf->trits[i] > 1) {
+            fprintf(stderr, "Invalid trit: %d\n", buf->trits[i]);
+            exit(1);
+        }
+        char c = buf->trits[i] == -1 ? '-' : (buf->trits[i] == 0 ? '0' : '+');
+        putchar(c);
+    }
+    putchar('\n');
+}
+void binary_to_trits(const uint8_t* binary, int binary_length, T81TritBuffer* trits, int chunk_size) {
+    static const uint8_t bit_to_trit_map[32][3] = {
+        {-1, -1, -1}, {-1, -1, 0}, {-1, -1, 1}, {-1, 0, -1}, {-1, 0, 0}, {-1, 0, 1}, {-1, 1, -1}, {-1, 1, 0},
+        {-1, 1, 1}, {0, -1, -1}, {0, -1, 0}, {0, -1, 1}, {0, 0, -1}, {0, 0, 0}, {0, 0, 1}, {0, 1, -1},
+        {0, 1, 0}, {0, 1, 1}, {1, -1, -1}, {1, -1, 0}, {1, -1, 1}, {1, 0, -1}, {1, 0, 0}, {1, 0, 1},
+        {1, 1, -1}, {1, 1, 0}, {1, 1, 1}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}
+    };
+    if (chunk_size != 5) {
+        fprintf(stderr, "Only chunk_size=5 is supported\n");
+        exit(1);
+    }
+    trits->length = 0;
+    int bit_pos = 0;
+    while (bit_pos < binary_length * 8 && trits->length + 3 <= MAX_TRITS) {
+        int value = 0;
+        for (int i = 0; i < 5 && bit_pos < binary_length * 8; ++i) {
+            value = (value << 1) | ((binary[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1);
+            bit_pos++;
+        }
+        if (value < 27) {
+            trits->trits[trits->length++] = bit_to_trit_map[value][0];
+            trits->trits[trits->length++] = bit_to_trit_map[value][1];
+            trits->trits[trits->length++] = bit_to_trit_map[value][2];
+        }
+    }
+    if (bit_pos < binary_length * 8 && trits->length < MAX_TRITS) {
+        int remaining = binary_length * 8 - bit_pos;
+        for (int i = 0; i < remaining && trits->length < MAX_TRITS; ++i) {
+            trits->trits[trits->length++] = 0;
+        }
+    }
+}
+double entropy_score(const T81TritBuffer* data) {
+    if (data->length <= 0) return 0.0;
+    int counts[TRIT_VALUES] = {0};
+    for (int i = 0; i < data->length; ++i) {
+        if (data->trits[i] < -1 || data->trits[i] > 1) {
+            fprintf(stderr, "Invalid trit: %d\n", data->trits[i]);
+            exit(1);
+        }
+        counts[data->trits[i] + 1]++;
+    }
+    double score = 0.0;
+    for (int i = 0; i < TRIT_VALUES; ++i) {
+        if (counts[i] > 0) {
+            double p = counts[i] / (double)data->length;
+            score -= p * log2(p);
+        }
+    }
+    return score;
+}
+@1 Key Scheduling
+@<Key Scheduling@>=
+void derive_key(const T81TritBuffer key, T81TritBuffer* derived, int target_length) {
+    if (key->length == 0) {
+        fprintf(stderr, "Empty key\n");
+        exit(1);
+    }
+    derived->length = target_length;
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((unsigned char*)key->trits, key->length * sizeof(Trit), hash);
+    for (int i = 0; i < target_length; ++i) {
+        derived->trits[i] = (Trit)((hash[i % SHA256_DIGEST_LENGTH] % TRIT_VALUES) - 1);
+    }
+}
+@*1 Cipher Decryptors
+@<Cipher Decryptors@>=
+Trit ternary_xor(Trit a, Trit b) {
+    static const Trit xor_table[3][3] = {
+        {0, -1, 1}, {-1, 0, 1}, {1, 1, 0}
+    };
+    return xor_table[a + 1][b + 1];
+}
+void refc_decrypt(const T81TritBuffer* input, const T81TritBuffer* key, T81TritBuffer* output) {
+    if (input->length == 0 || key->length == 0) {
+        fprintf(stderr, "Invalid REFC input or key\n");
+        exit(1);
+    }
+    output->length = input->length;
+    for (int i = 0; i < input->length; ++i) {
+        output->trits[i] = (input->trits[i] - key->trits[i % key->length]) % 3;
+        if (output->trits[i] > 1) output->trits[i] -= 3;
+    }
+}
+void aecs_decrypt(const T81TritBuffer* input, const T81TritBuffer* key, T81TritBuffer* output) {
+    if (input->length == 0 || key->length == 0) {
+        fprintf(stderr, "Invalid AECS input or key\n");
+        exit(1);
+    }
+    output->length = input->length;
+    for (int i = 0; i < input->length; ++i) {
+        output->trits[i] = ternary_xor(input->trits[i], key->trits[i % key->length]);
+    }
+}
+void rtpe_decrypt(const T81TritBuffer* input, const T81TritBuffer* key, T81TritBuffer* output) {
+    if (input->length == 0 || key->length == 0) {
+        fprintf(stderr, "Invalid RTPE input or key\n");
+        exit(1);
+    }
+    output->length = input->length;
+    for (int i = 0; i < input->length; ++i) {
+        output->trits[i] = (input->trits[i] - key->trits[(i * i) % key->length]) % 3;
+        if (output->trits[i] > 1) output->trits[i] -= 3;
+    }
+}
+void trtsc_decrypt(const T81TritBuffer* input, const T81TritBuffer* key, T81TritBuffer* output) {
+    if (input->length == 0 || key->length == 0) {
+        fprintf(stderr, "Invalid TRTSC input or key\n");
+        exit(1);
+    }
+    output->length = input->length;
+    for (int i = 0; i < input->length; ++i) {
+        output->trits[i] = (input->trits[i] + key->trits[(input->length - 1 - i) % key->length]) % 3;
+        if (output->trits[i] > 1) output->trits[i] -= 3;
+    }
+}
+@1 File Input and Parsing
+@<File Input and Parsing@>=
+void load_key(const char keyfile, T81TritBuffer* key, int is_binary) {
+    FILE* f = (strcmp(keyfile, "-") == 0) ? stdin : fopen(keyfile, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open key file %s\n", keyfile);
+        exit(1);
+    }
+    uint8_t buffer[MAX_KEY_SIZE];
+    int length = fread(buffer, 1, MAX_KEY_SIZE, f);
+    if (f != stdin) fclose(f);
+    if (is_binary) {
+        binary_to_trits(buffer, length, key, 5);
+    } else {
+        key->length = length > MAX_KEY_SIZE ? MAX_KEY_SIZE : length;
+        for (int i = 0; i < key->length; ++i) {
+            if (buffer[i] > 2) {
+                fprintf(stderr, "Invalid trit value in key: %d\n", buffer[i]);
+                exit(1);
+            }
+            key->trits[i] = (Trit)(buffer[i] - 1);
+        }
+    }
+}
+void load_ciphertext(const char* filename, T81ZHeader* header, uint8_t* compressed_data, int* compressed_length) {
+    FILE* f = (strcmp(filename, "-") == 0) ? stdin : fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open ciphertext file %s\n", filename);
+        exit(1);
+    }
+    if (fread(header, sizeof(T81ZHeader), 1, f) != 1) {
+        fprintf(stderr, "Error: Failed to read header from %s\n", filename);
+        if (f != stdin) fclose(f);
+        exit(1);
+    }
+    if (strncmp(header->magic, "T81Z", 4) != 0) {
+        fprintf(stderr, "Invalid T81Z file format: %s\n", filename);
+        if (f != stdin) fclose(f);
+        exit(1);
+    }
+    *compressed_length = fread(compressed_data, 1, MAX_TRITS, f);
+    if (f != stdin) fclose(f);
+}
+@<Load Key from File@>=
+load_key(key_file, &key, key_is_binary);
+@<Load Ciphertext and Header@>=
+load_ciphertext(ciphertext_file, &header, compressed_data, &compressed_length);
+@1 Decompression Routines
+@<Decompression Routines@>=
+void build_huffman_table(HuffmanTable table) {
+    table->codes[0].length = 2; // -1: 10
+    table->codes[0].code[0] = 1; table->codes[0].code[1] = 0;
+    table->codes[1].length = 1; // 0: 0
+    table->codes[1].code[0] = 0;
+    table->codes[2].length = 2; // +1: 11
+    table->codes[2].code[0] = 1; table->codes[2].code[1] = 1;
+}
+void huffman_decompress(const uint8_t* buffer, int buffer_length, T81TritBuffer* data) {
+    HuffmanTable table;
+    build_huffman_table(&table);
+    int bit_pos = 0;
+    data->length = 0;
+    while (bit_pos < buffer_length * 8 && data->length < MAX_TRITS) {
+        if (buffer[bit_pos / 8] & (1 << (7 - (bit_pos % 8)))) {
+            bit_pos++;
+            if (bit_pos >= buffer_length * 8) break;
+            if (buffer[bit_pos / 8] & (1 << (7 - (bit_pos % 8)))) {
+                data->trits[data->length++] = 1; // 11 -> +1
+            } else {
+                data->trits[data->length++] = -1; // 10 -> -1
+            }
+            bit_pos++;
+        } else {
+            data->trits[data->length++] = 0; // 0 -> 0
+            bit_pos++;
+        }
+    }
+}
+void rle_decompress(const uint8_t* buffer, int buffer_length, T81TritBuffer* data) {
+    data->length = 0;
+    for (int i = 0; i < buffer_length && data->length < MAX_TRITS; i += 2) {
+        if (i + 1 >= buffer_length) {
+            fprintf(stderr, "Invalid RLE data\n");
+            exit(1);
+        }
+        Trit t = (Trit)(buffer[i] - 1);
+        int run = buffer[i + 1];
+        if (data->length + run > MAX_TRITS) {
+            fprintf(stderr, "RLE decompression overflow\n");
+            exit(1);
+        }
+        for (int j = 0; j < run; ++j) {
+            data->trits[data->length++] = t;
+        }
+    }
+}
+@<Decompress Based on Header@>=
+if (strncmp(header.method, "RLE", 3) == 0) {
+    rle_decompress(compressed_data, compressed_length, &ciphertext);
+} else if (strncmp(header.method, "HUF", 3) == 0) {
+    huffman_decompress(compressed_data, compressed_length, &ciphertext);
+} else if (strncmp(header.method, "REFC", 4) == 0 || strncmp(header.method, "AECS", 4) == 0 ||
+           strncmp(header.method, "RTPE", 4) == 0 || strncmp(header.method, "TRTSC", 4) == 0) {
+    ciphertext.length = compressed_length > MAX_TRITS ? MAX_TRITS : compressed_length;
+    for (int i = 0; i < ciphertext.length; ++i) {
+        ciphertext.trits[i] = (Trit)(compressed_data[i] - 1);
+    }
+} else {
+    fprintf(stderr, "Unknown method in T81Z file: %.4s\n", header.method);
+    exit(1);
+}
+if (verbose) {
+    printf("Decompressed ciphertext (%s):\n", header.method);
+    print_trits("Ciphertext", &ciphertext);
+}
+@1 Validation and Output
+@<Validation and Output@>=
+uint32_t compute_crc32(const T81TritBuffer data) {
+    unsigned char* bytes = (unsigned char*)data->trits;
+    uint32_t crc = 0;
+    SHA256(bytes, data->length * sizeof(Trit), (unsigned char*)&crc);
+    return crc;
+}
+void validate_decryption(const T81TritBuffer* decrypted, const T81ZHeader* header, double* entropy, int* valid) {
+    *entropy = entropy_score(decrypted);
+    *valid = (decrypted->length == header->original_length) && (compute_crc32(decrypted) == header->crc32);
+}
+void output_result(const T81TritBuffer* decrypted, const char* output_file, int valid, double entropy, double time_taken, int verbose) {
+    printf("Decryption Result:\n");
+    if (verbose) {
+        print_trits("Decrypted Plaintext", decrypted);
+    }
+    printf("  Length: %d trits\n", decrypted->length);
+    printf("  Entropy: %.2f bits/trit\n", entropy);
+    printf("  Valid: %s\n", valid ? "Yes" : "No");
+    printf("  Time: %.4f seconds\n", time_taken);
+    if (output_file) {
+        FILE* f = (strcmp(output_file, "-") == 0) ? stdout : fopen(output_file, "wb");
+        if (!f) {
+            fprintf(stderr, "Error: Could not open output file %s\n", output_file);
+            exit(1);
+        }
+        fwrite(decrypted->trits, sizeof(Trit), decrypted->length, f);
+        if (f != stdout) fclose(f);
+        printf("  Output written to: %s\n", output_file);
+    }
+}
+@<Validate Decryption@>=
+validate_decryption(&decrypted, &header, &entropy, &valid);
+@<Output Result@>=
+output_result(&decrypted, output_file, valid, entropy, time_taken, verbose);
+@*1 Select and Run Decryption
+@<Select and Run Decryption@>=
+if (strncmp(header.method, "REFC", 4) == 0) {
+    refc_decrypt(&ciphertext, &derived_key, &decrypted);
+} else if (strncmp(header.method, "AECS", 4) == 0) {
+    aecs_decrypt(&ciphertext, &derived_key, &decrypted);
+} else if (strncmp(header.method, "RTPE", 4) == 0) {
+    rtpe_decrypt(&ciphertext, &derived_key, &decrypted);
+} else if (strncmp(header.method, "TRTSC", 4) == 0) {
+    trtsc_decrypt(&ciphertext, &derived_key, &decrypted);
+} else {
+    fprintf(stderr, "Unsupported cipher method: %.4s\n", header.method);
+    exit(1);
+}

@@ -1,0 +1,471 @@
+// axionctl.cweb | Userspace CLI Tool for Axion AI Kernel Module
+@* This tool allows userland interaction with the Axion AI kernel module
+via the DebugFS interface at `/sys/kernel/debug/axion-ai` and the
+/dev/axion-ai device for IOCTL communication. It supports command
+dispatching, stack inspection with entropy, structured JSON output,
+coprocessor instruction support, and ZeroMQ integration for visualization.
+
+Synergy Enhancements:
+- Read entropy values per stack item via IOCTL.
+- Session logging to ~/.axionctl/logs/ with timestamped files.
+- Auto-detect DebugFS mount path using /proc/mounts.
+- Structured I/O with JSON output for stack, status, and visualization.
+- ZeroMQ PUB socket for visualization dashboard integration.
+- Support for coprocessor instructions (tadd, tmul, tneg).
+- Partial rollback command for granular state recovery.
+- IOCTL for direct coprocessor instruction queuing.
+
+@c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <libgen.h>
+#include <jansson.h>
+#include <zmq.h>
+#include <pwd.h>
+
+#define MAX_BUF 1024
+#define DEFAULT_DEBUGFS_PATH "/sys/kernel/debug/axion-ai"
+#define DEVICE_PATH "/dev/axion-ai"
+#define ZMQ_ENDPOINT "tcp://127.0.0.1:5555"
+#define SESSION_LOG_DIR "~/.axionctl/logs"
+#define IOCTL_MAGIC 'A'
+#define IOCTL_PUSH _IOW(IOCTL_MAGIC, 1, struct t81_unit)
+#define IOCTL_POP  _IOR(IOCTL_MAGIC, 2, struct t81_unit)
+#define IOCTL_EXEC _IOW(IOCTL_MAGIC, 3, unsigned int)
+#define IOCTL_SET_INPUT _IOW(IOCTL_MAGIC, 4, uint32_t)
+#define IOCTL_QUEUE_COPROCESSOR _IOW(IOCTL_MAGIC, 5, struct t81_coprocessor_instr)
+
+typedef enum { TERN_LOW = -1, TERN_MID = 0, TERN_HIGH = 1 } t81_ternary_t;
+struct t81_unit {
+    t81_ternary_t value;
+    unsigned char entropy;
+    void *ops; /* Null in userspace */
+};
+
+struct t81_coprocessor_instr {
+    uint8_t opcode; // TADD=0, TMUL=1, TNEG=2, etc.
+    uint8_t dst_reg;
+    uint8_t src1_reg;
+    uint8_t src2_reg;
+};
+
+static char debugfs_path[256] = DEFAULT_DEBUGFS_PATH;
+static void *zmq_ctx = NULL;
+static void *zmq_sock = NULL;
+static FILE *session_log = NULL;
+static char session_id[64] = "default";
+
+@<Detect DebugFS Path@>=
+void detect_debugfs_path(void) {
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) {
+        perror("fopen /proc/mounts");
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "debugfs")) {
+            char *path = strtok(line, " ");
+            path = strtok(NULL, " ");
+            snprintf(debugfs_path, sizeof(debugfs_path), "%s/axion-ai", path);
+            break;
+        }
+    }
+    fclose(f);
+    printf("[axionctl] DebugFS path: %s\n", debugfs_path);
+}
+
+@<Initialize Session Logging@>=
+void init_session_logging(void) {
+    struct passwd *pw = getpwuid(getuid());
+    if (!pw) {
+        perror("getpwuid");
+        return;
+    }
+    char log_dir[256];
+    snprintf(log_dir, sizeof(log_dir), "%s/.axionctl/logs", pw->pw_dir);
+    mkdir(log_dir, 0755); /* Ignore errors if exists */
+
+    time_t now = time(NULL);
+    char log_file[512];
+    snprintf(log_file, sizeof(log_file), "%s/axionctl_%s_%ld.log", log_dir, session_id, now);
+    session_log = fopen(log_file, "a");
+    if (!session_log) {
+        perror("fopen session log");
+        return;
+    }
+    fprintf(session_log, "[%ld] Session %s started\n", now, session_id);
+    fflush(session_log);
+}
+
+void log_session(const char *msg) {
+    if (session_log) {
+        time_t now = time(NULL);
+        fprintf(session_log, "[%ld] %s\n", now, msg);
+        fflush(session_log);
+    }
+}
+
+@<Initialize ZeroMQ@>=
+void init_zeromq(void) {
+    zmq_ctx = zmq_ctx_new();
+    if (!zmq_ctx) {
+        fprintf(stderr, "[axionctl] Failed to create ZeroMQ context\n");
+        return;
+    }
+    zmq_sock = zmq_socket(zmq_ctx, ZMQ_PUB);
+    if (!zmq_sock) {
+        fprintf(stderr, "[axionctl] Failed to create ZeroMQ socket\n");
+        zmq_ctx_destroy(zmq_ctx);
+        zmq_ctx = NULL;
+        return;
+    }
+    if (zmq_bind(zmq_sock, ZMQ_ENDPOINT) < 0) {
+        fprintf(stderr, "[axionctl] Failed to bind ZeroMQ socket: %s\n", zmq_strerror(errno));
+        zmq_close(zmq_sock);
+        zmq_ctx_destroy(zmq_ctx);
+        zmq_sock = NULL;
+        zmq_ctx = NULL;
+        return;
+    }
+    printf("[axionctl] ZeroMQ publishing on %s\n", ZMQ_ENDPOINT);
+}
+
+@<Send NLP Command@>=
+void send_command(const char *cmd, int retries) {
+    int fd = open(debugfs_path, O_WRONLY);
+    if (fd < 0) {
+        perror("open debugfs");
+        exit(EXIT_FAILURE);
+    }
+    char buf[MAX_BUF];
+    snprintf(buf, sizeof(buf), "cmd:%s", cmd);
+    int attempt = 0;
+    while (attempt <= retries) {
+        if (write(fd, buf, strlen(buf)) >= 0) {
+            printf("[axionctl] Sent command: %s\n", cmd);
+            log_session(buf);
+            if (zmq_sock) {
+                json_t *msg = json_pack("{s:s}", "command", cmd);
+                char *msg_str = json_dumps(msg, JSON_COMPACT);
+                zmq_send(zmq_sock, msg_str, strlen(msg_str), 0);
+                free(msg_str);
+                json_decref(msg);
+            }
+            close(fd);
+            return;
+        }
+        attempt++;
+        if (attempt <= retries) {
+            fprintf(stderr, "[axionctl] Retry %d/%d for command: %s\n", attempt, retries, cmd);
+            usleep(100000); // 100ms delay
+        }
+    }
+    perror("write debugfs");
+    close(fd);
+    exit(EXIT_FAILURE);
+}
+
+@<Read Stack Contents@>=
+void read_stack(int json_output) {
+    int fd = open(DEVICE_PATH, O_RDWR);
+    if (fd < 0) {
+        perror("open /dev/axion-ai");
+        exit(EXIT_FAILURE);
+    }
+    json_t *stack = json_array();
+    struct t81_unit unit;
+    int count = 0;
+    while (ioctl(fd, IOCTL_POP, &unit) == 0) {
+        json_t *item = json_pack("{s:i,s:i}", "value", unit.value, "entropy", unit.entropy);
+        json_array_append_new(stack, item);
+        count++;
+    }
+    close(fd);
+    if (json_output) {
+        char *out = json_dumps(stack, JSON_INDENT(2));
+        printf("%s\n", out);
+        free(out);
+    } else {
+        printf("[axionctl] Stack state (%d items):\n", count);
+        for (size_t i = 0; i < json_array_size(stack); i++) {
+            json_t *item = json_array_get(stack, i);
+            printf("  Item %zu: value=%d, entropy=0x%02x\n",
+                   i, (int)json_integer_value(json_object_get(item, "value")),
+                   (unsigned)json_integer_value(json_object_get(item, "entropy")));
+        }
+    }
+    if (zmq_sock) {
+        char *msg_str = json_dumps(stack, JSON_COMPACT);
+        zmq_send(zmq_sock, msg_str, strlen(msg_str), 0);
+        free(msg_str);
+    }
+    char log_buf[256];
+    snprintf(log_buf, sizeof(log_buf), "Read stack: %d items", count);
+    log_session(log_buf);
+    json_decref(stack);
+}
+
+@<Inject Stack Values@>=
+void inject_values(const char *values) {
+    int fd = open(DEVICE_PATH, O_RDWR);
+    if (fd < 0) {
+        perror("open /dev/axion-ai");
+        exit(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < strlen(values); i++) {
+        struct t81_unit unit = {
+            .value = (values[i] % 3) - 1, // Map to -1, 0, 1
+            .entropy = values[i],
+            .ops = NULL
+        };
+        if (ioctl(fd, IOCTL_PUSH, &unit) < 0) {
+            perror("ioctl push");
+            close(fd);
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (ioctl(fd, IOCTL_EXEC, 0) < 0) { // Default to ADD
+        perror("ioctl exec");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+    close(fd);
+    printf("[axionctl] Injected values to stack.\n");
+    char log_buf[256];
+    snprintf(log_buf, sizeof(log_buf), "Injected values: %s", values);
+    log_session(log_buf);
+    if (zmq_sock) {
+        json_t *msg = json_pack("{s:s}", "inject", values);
+        char *msg_str = json_dumps(msg, JSON_COMPACT);
+        zmq_send(zmq_sock, msg_str, strlen(msg_str), 0);
+        free(msg_str);
+        json_decref(msg);
+    }
+}
+
+@<Queue Coprocessor Instruction@>=
+void queue_coprocessor_instruction(const char *cmd) {
+    int fd = open(DEVICE_PATH, O_RDWR);
+    if (fd < 0) {
+        perror("open /dev/axion-ai");
+        exit(EXIT_FAILURE);
+    }
+    struct t81_coprocessor_instr instr = {0};
+    if (strncmp(cmd, "tadd ", 5) == 0) {
+        instr.opcode = 0; // TADD
+        if (sscanf(cmd + 5, "%hhu %hhu %hhu", &instr.dst_reg, &instr.src1_reg, &instr.src2_reg) != 3) {
+            fprintf(stderr, "[axionctl] Invalid tadd format: %s\n", cmd);
+            close(fd);
+            exit(EXIT_FAILURE);
+        }
+    } else if (strncmp(cmd, "tmul ", 5) == 0) {
+        instr.opcode = 1; // TMUL
+        if (sscanf(cmd + 5, "%hhu %hhu %hhu", &instr.dst_reg, &instr.src1_reg, &instr.src2_reg) != 3) {
+            fprintf(stderr, "[axionctl] Invalid tmul format: %s\n", cmd);
+            close(fd);
+            exit(EXIT_FAILURE);
+        }
+    } else if (strncmp(cmd, "tneg ", 5) == 0) {
+        instr.opcode = 2; // TNEG
+        if (sscanf(cmd + 5, "%hhu %hhu", &instr.dst_reg, &instr.src1_reg) != 2) {
+            fprintf(stderr, "[axionctl] Invalid tneg format: %s\n", cmd);
+            close(fd);
+            exit(EXIT_FAILURE);
+        }
+        instr.src2_reg = 0;
+    } else {
+        fprintf(stderr, "[axionctl] Unknown coprocessor command: %s\n", cmd);
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+    if (ioctl(fd, IOCTL_QUEUE_COPROCESSOR, &instr) < 0) {
+        perror("ioctl queue coprocessor");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+    close(fd);
+    printf("[axionctl] Queued coprocessor instruction: %s\n", cmd);
+    char log_buf[256];
+    snprintf(log_buf, sizeof(log_buf), "Queued coprocessor: %s", cmd);
+    log_session(log_buf);
+    if (zmq_sock) {
+        json_t *msg = json_pack("{s:s,s:i,s:i,s:i,s:i}",
+                                "coprocessor", cmd,
+                                "opcode", instr.opcode,
+                                "dst_reg", instr.dst_reg,
+                                "src1_reg", instr.src1_reg,
+                                "src2_reg", instr.src2_reg);
+        char *msg_str = json_dumps(msg, JSON_COMPACT);
+        zmq_send(zmq_sock, msg_str, strlen(msg_str), 0);
+        free(msg_str);
+        json_decref(msg);
+    }
+}
+
+@<Read Visualization@>=
+void read_visualization(int json_output) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/visualization", debugfs_path);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open visualization");
+        exit(EXIT_FAILURE);
+    }
+    char buf[8192];
+    ssize_t len = read(fd, buf, sizeof(buf) - 1);
+    if (len < 0) {
+        perror("read visualization");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+    buf[len] = '\0';
+    close(fd);
+    if (json_output) {
+        printf("%s\n", buf);
+    } else {
+        json_t *json;
+        json_error_t error;
+        json = json_loads(buf, 0, &error);
+        if (!json) {
+            fprintf(stderr, "[axionctl] JSON parse error: %s\n", error.text);
+            exit(EXIT_FAILURE);
+        }
+        printf("[axionctl] Visualization:\n");
+        printf("  Stack pointer: %lld\n", json_integer_value(json_object_get(json, "pointer")));
+        printf("  Session: %s\n", json_string_value(json_object_get(json, "session")));
+        printf("  Commands: %lld\n", json_integer_value(json_object_get(json, "commands")));
+        json_t *stack = json_object_get(json, "stack");
+        printf("  Stack contents (%zu items):\n", json_array_size(stack));
+        for (size_t i = 0; i < json_array_size(stack); i++) {
+            json_t *item = json_array_get(stack, i);
+            printf("    Item %zu: value=%lld, entropy=0x%02llx\n",
+                   i,
+                   json_integer_value(json_object_get(item, "value")),
+                   json_integer_value(json_object_get(item, "entropy")));
+        }
+        json_t *coprocessor = json_object_get(json, "coprocessor");
+        if (coprocessor) {
+            printf("  Coprocessor state:\n");
+            printf("    Cycle count: %lld\n", json_integer_value(json_object_get(coprocessor, "cycle_count")));
+            json_t *regs = json_object_get(coprocessor, "registers");
+            for (size_t i = 0; i < json_array_size(regs); i++) {
+                json_t *reg = json_array_get(regs, i);
+                json_t *r0 = json_object_get(reg, "R0");
+                if (r0) {
+                    printf("    R%zu: value=%lld, entropy=0x%02llx\n",
+                           i,
+                           json_integer_value(json_object_get(r0, "value")),
+                           json_integer_value(json_object_get(r0, "entropy")));
+                }
+            }
+        }
+        json_decref(json);
+    }
+    char log_buf[256];
+    snprintf(log_buf, sizeof(log_buf), "Read visualization");
+    log_session(log_buf);
+    if (zmq_sock) {
+        zmq_send(zmq_sock, buf, len, 0);
+    }
+}
+
+@<JSON Status Output@>=
+void status(int json_output) {
+    send_command("status", 3); // Retry up to 3 times
+}
+
+@<Usage Help@>=
+void print_usage(const char *prog) {
+    fprintf(stderr, "\nAxion CLI Tool\n");
+    fprintf(stderr, "Usage: %s <command> [args] [--json] [--session <id>]\n\n", prog);
+    fprintf(stderr, "Commands:\n");
+    fprintf(stderr, "  read\t\t\tRead ternary stack with entropy\n");
+    fprintf(stderr, "  cmd <command>\t\tSend NLP command (e.g., optimize, rollback, tadd 0 1 2)\n");
+    fprintf(stderr, "  coprocessor <cmd>\tQueue coprocessor instruction (e.g., tadd 0 1 2, tmul 0 1 2, tneg 0 1)\n");
+    fprintf(stderr, "  inject <data>\t\tInject raw data into ternary stack\n");
+    fprintf(stderr, "  viz\t\t\tRead visualization data\n");
+    fprintf(stderr, "  status\t\tRequest stack and session status\n");
+    fprintf(stderr, "  help\t\t\tShow this help message\n\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --json\t\tOutput in JSON format (for read, viz, status)\n");
+    fprintf(stderr, "  --session <id>\tSet session ID for logging\n");
+    exit(EXIT_FAILURE);
+}
+
+@<Cleanup@>=
+void cleanup(void) {
+    if (session_log) {
+        time_t now = time(NULL);
+        fprintf(session_log, "[%ld] Session %s ended\n", now, session_id);
+        fclose(session_log);
+    }
+    if (zmq_sock) {
+        zmq_close(zmq_sock);
+    }
+    if (zmq_ctx) {
+        zmq_ctx_destroy(zmq_ctx);
+    }
+}
+
+@<Main Routine@>=
+int main(int argc, char *argv[]) {
+    atexit(cleanup);
+    detect_debugfs_path();
+    int json_output = 0;
+    int i;
+
+    // Parse --session and --json options
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--session") == 0 && i + 1 < argc) {
+            strncpy(session_id, argv[i + 1], sizeof(session_id) - 1);
+            session_id[sizeof(session_id) - 1] = '\0';
+            i++;
+        } else if (strcmp(argv[i], "--json") == 0) {
+            json_output = 1;
+        }
+    }
+
+    init_session_logging();
+    init_zeromq();
+    send_command("session", 3); // Register session
+    send_command(session_id, 3); // Send session ID
+
+    if (argc < 2 || strcmp(argv[1], "help") == 0)
+        print_usage(argv[0]);
+
+    if (strcmp(argv[1], "read") == 0 && argc <= 4) {
+        read_stack(json_output);
+    } else if (strcmp(argv[1], "cmd") == 0 && argc <= 5) {
+        char cmd[MAX_BUF];
+        snprintf(cmd, sizeof(cmd), "%s %s %s",
+                 argc > 2 ? argv[2] : "",
+                 argc > 3 ? argv[3] : "",
+                 argc > 4 ? argv[4] : "");
+        send_command(cmd, 3);
+    } else if (strcmp(argv[1], "coprocessor") == 0 && argc <= 5) {
+        char cmd[MAX_BUF];
+        snprintf(cmd, sizeof(cmd), "%s %s %s",
+                 argc > 2 ? argv[2] : "",
+                 argc > 3 ? argv[3] : "",
+                 argc > 4 ? argv[4] : "");
+        queue_coprocessor_instruction(cmd);
+    } else if (strcmp(argv[1], "inject") == 0 && argc <= 4) {
+        inject_values(argc > 2 ? argv[2] : "");
+    } else if (strcmp(argv[1], "viz") == 0 && argc <= 4) {
+        read_visualization(json_output);
+    } else if (strcmp(argv[1], "status") == 0 && argc <= 4) {
+        status(json_output);
+    } else {
+        print_usage(argv[0]);
+    }
+
+    return 0;
+}

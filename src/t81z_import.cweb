@@ -1,0 +1,66 @@
+@* T81Z Importer: Load Symbolic Reasoning Paths from .t81z
+This module parses a .t81z file containing ternary symbolic reasoning paths,
+reconstructs each trit sequence, and outputs a human-readable trace or passes
+to AxionCLI or HanoiVM for further execution.
+
+@s T81ZHeader struct
+@s trit int
+
+@*1 Include Dependencies
+@c
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <json-c/json.h>
+
+typedef int8_t trit;
+
+@*1 Define T81Z Header Format
+@c
+typedef struct {
+  char magic[4];     // 'T81Z'
+  uint8_t version;   // Format version
+  uint16_t count;    // Number of reasoning paths
+  uint32_t total_trits;
+} T81ZHeader;
+
+@*1 Load and Print .t81z File
+@c
+json_object *load_t81z(const char *filename) {
+  FILE *fin = fopen(filename, "rb");
+  if (!fin) {
+    perror("fopen");
+    return NULL;
+  }
+
+  T81ZHeader header;
+  fread(&header, sizeof(T81ZHeader), 1, fin);
+
+  if (strncmp(header.magic, "T81Z", 4) != 0) {
+    fprintf(stderr, "Invalid file format.\n");
+    fclose(fin);
+    return NULL;
+  }
+
+  json_object *root = json_object_new_array();
+
+  for (uint16_t i = 0; i < header.count; i++) {
+    uint8_t len;
+    fread(&len, sizeof(uint8_t), 1, fin);
+
+    json_object *path = json_object_new_array();
+    for (uint8_t j = 0; j < len; j++) {
+      trit t;
+      fread(&t, sizeof(trit), 1, fin);
+      json_object_array_add(path, json_object_new_int(t));
+    }
+
+    json_object *entry = json_object_new_object();
+    json_object_object_add(entry, "path", path);
+    json_object_array_add(root, entry);
+  }
+
+  fclose(fin);
+  return root;
+}

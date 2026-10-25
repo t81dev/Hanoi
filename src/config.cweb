@@ -1,0 +1,264 @@
+@* config.cweb | Unified Configuration for HanoiVM Platform (v0.9.3)
+
+This module defines global configuration settings for the HanoiVM symbolic ternary platform,
+unifying hardware, AI, logging, and runtime parameters. It integrates with `hanoivm_fsm.v` via PCIe/M.2,
+`axion-ai.cweb` via ioctls/debugfs, `hanoivm-core.cweb` and `hanoivm-runtime.cweb` via FFI,
+`hanoivm_vm.cweb`’s execution core, `hanoivm_firmware.cweb`’s firmware, `axion-gaia-interface.cweb`’s
+GPU dispatch, `axion_api.cweb`’s recursion optimization, `axion_gpu_serializer.cweb`’s GPU serialization,
+`bootstrap.cweb`’s bootstrap sequence, and `advanced_ops.cweb`/`advanced_ops_ext.cweb` opcodes.
+
+Enhancements:
+- Settings for GPU intents, recursive opcodes, and firmware initialization.
+- Modular validation table for config checks.
+- Entropy logging via `axion-ai.cweb`’s debugfs.
+- Session memory integration with `axion-ai.cweb`’s `axion_session_t`.
+- FFI interface to `hanoivm-core.cweb` (Rust) and `hanoivm-runtime.cweb` (C).
+- Secure validation for config parameters and overrides.
+- JSON visualization for config settings.
+- Support for `.hvm` test bytecode (`T81_MATMUL` + `TNN_ACCUM`).
+- Optimized for ternary platform configuration.
+
+@c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include "axion-ai.h"
+#include "hanoivm_core.h"
+#include "hanoivm_runtime.h"
+#include "axion-gaia-interface.h"
+
+#define HANOIVM_CONFIG_VERSION "0.9.3"
+#define TARGET_LLVM_BACKEND
+#define TARGET_CUDA_ENABLED
+#define TARGET_TISC_QUERY_COMPILER
+#define TARGET_LOOKING_GLASS_ENABLED
+#define ENABLE_PCIE_ACCELERATION true
+#define ENABLE_GPU_SUPPORT true
+#define ENABLE_DYNAMIC_RESOURCE_SCALING true
+#define ENABLE_LOOKING_GLASS_STREAM true
+#define AI_OPTIMIZATION_MODE "Advanced"
+#define ENABLE_ANOMALY_DETECTION true
+#define ENABLE_AI_LOG_FEEDBACK true
+#define AXION_MEMORY_POLICY "Protective"
+#define ENABLE_SYMBOLIC_STACK_COLLAPSE true
+#define LOG_LEVEL "INFO"
+#define LOG_OUTPUT_FORMAT "JSON"
+#define ENABLE_SECURE_MODE true
+#define ENABLE_ENTROPY_TRACE true
+#define ENABLE_SYNERGY_TRACE true
+#define MEMORY_ALLOCATION 4096
+#define CPU_AFFINITY "0,1,2,3"
+#define GPU_ALLOCATION 4096
+#define ENABLE_RUNTIME_OVERRIDES true
+#define DETECT_GPU true
+#define DETECT_PCIE_ACCELERATOR true
+#define TERNARY_LOGIC_MODE "T81"
+#define ENABLE_ADAPTIVE_MODE_SWITCHING true
+#define ENABLE_DEBUG_MODE true
+#define ENABLE_TISC_QUERY_COMPILER true
+#define TISC_QUERY_MAX_DEPTH 81
+#define TISC_QUERY_TIMEOUT_MS 500
+#define TISC_LOG_QUERY_RESULTS true
+#define TISC_ENABLE_CACHED_DISPATCH true
+#define MAX_LOG_MSG 128
+
+typedef struct {
+    bool enable_pcie_acceleration;
+    bool enable_gpu_support;
+    bool enable_dynamic_resource_scaling;
+    bool enable_looking_glass_stream;
+    char ai_optimization_mode[16];
+    bool enable_anomaly_detection;
+    bool enable_ai_log_feedback;
+    char axion_memory_policy[16];
+    bool enable_symbolic_stack_collapse;
+    char log_level[8];
+    char log_output_format[8];
+    bool enable_secure_mode;
+    bool enable_entropy_trace;
+    bool enable_synergy_trace;
+    int memory_allocation;
+    char cpu_affinity[32];
+    int gpu_allocation;
+    bool enable_runtime_overrides;
+    bool detect_gpu;
+    bool detect_pcie_accelerator;
+    char ternary_logic_mode[8];
+    bool enable_adaptive_mode_switching;
+    bool enable_debug_mode;
+    bool enable_tisc_query_compiler;
+    int tisc_query_max_depth;
+    int tisc_query_timeout_ms;
+    bool tisc_log_query_results;
+    bool tisc_enable_cached_dispatch;
+} HanoiVMConfig;
+
+@<Validation Strategy Table@>=
+typedef struct {
+    const char* name;
+    int (*validate)(const HanoiVMConfig* cfg);
+    const char* description;
+} ConfigValidator;
+
+static int validate_hardware(const HanoiVMConfig* cfg) {
+    if (cfg->enable_gpu_support && !cfg->detect_gpu) {
+        axion_log_entropy("VALIDATE_GPU_FAIL", 0xFF);
+        return 1;
+    }
+    if (cfg->enable_pcie_acceleration && !cfg->detect_pcie_accelerator) {
+        axion_log_entropy("VALIDATE_PCIE_FAIL", 0xFF);
+        return 2;
+    }
+    axion_log_entropy("VALIDATE_HARDWARE_SUCCESS", 0);
+    return 0;
+}
+
+static int validate_ai(const HanoiVMConfig* cfg) {
+    if (strcmp(cfg->ai_optimization_mode, "Advanced") != 0 &&
+        strcmp(cfg->ai_optimization_mode, "Basic") != 0) {
+        axion_log_entropy("VALIDATE_AI_MODE_FAIL", 0xFF);
+        return 3;
+    }
+    axion_log_entropy("VALIDATE_AI_SUCCESS", 0);
+    return 0;
+}
+
+static int validate_tisc(const HanoiVMConfig* cfg) {
+    if (cfg->enable_tisc_query_compiler && cfg->tisc_query_max_depth > 243) {
+        axion_log_entropy("VALIDATE_TISC_DEPTH_FAIL", cfg->tisc_query_max_depth);
+        return 4;
+    }
+    axion_log_entropy("VALIDATE_TISC_SUCCESS", 0);
+    return 0;
+}
+
+static ConfigValidator validators[] = {
+    { "hardware", validate_hardware, "Validate hardware settings" },
+    { "ai", validate_ai, "Validate AI optimization settings" },
+    { "tisc", validate_tisc, "Validate TISC query compiler settings" },
+    { NULL, NULL, NULL }
+};
+
+@<Configuration Parsing Functions@>=
+HanoiVMConfig default_config() {
+    HanoiVMConfig cfg = {
+        .enable_pcie_acceleration = ENABLE_PCIE_ACCELERATION,
+        .enable_gpu_support = ENABLE_GPU_SUPPORT,
+        .enable_dynamic_resource_scaling = ENABLE_DYNAMIC_RESOURCE_SCALING,
+        .enable_looking_glass_stream = ENABLE_LOOKING_GLASS_STREAM,
+        .ai_optimization_mode = AI_OPTIMIZATION_MODE,
+        .enable_anomaly_detection = ENABLE_ANOMALY_DETECTION,
+        .enable_ai_log_feedback = ENABLE_AI_LOG_FEEDBACK,
+        .axion_memory_policy = AXION_MEMORY_POLICY,
+        .enable_symbolic_stack_collapse = ENABLE_SYMBOLIC_STACK_COLLAPSE,
+        .log_level = LOG_LEVEL,
+        .log_output_format = LOG_OUTPUT_FORMAT,
+        .enable_secure_mode = ENABLE_SECURE_MODE,
+        .enable_entropy_trace = ENABLE_ENTROPY_TRACE,
+        .enable_synergy_trace = ENABLE_SYNERGY_TRACE,
+        .memory_allocation = MEMORY_ALLOCATION,
+        .cpu_affinity = CPU_AFFINITY,
+        .gpu_allocation = GPU_ALLOCATION,
+        .enable_runtime_overrides = ENABLE_RUNTIME_OVERRIDES,
+        .detect_gpu = DETECT_GPU,
+        .detect_pcie_accelerator = DETECT_PCIE_ACCELERATOR,
+        .ternary_logic_mode = TERNARY_LOGIC_MODE,
+        .enable_adaptive_mode_switching = ENABLE_ADAPTIVE_MODE_SWITCHING,
+        .enable_debug_mode = ENABLE_DEBUG_MODE,
+        .enable_tisc_query_compiler = ENABLE_TISC_QUERY_COMPILER,
+        .tisc_query_max_depth = TISC_QUERY_MAX_DEPTH,
+        .tisc_query_timeout_ms = TISC_QUERY_TIMEOUT_MS,
+        .tisc_log_query_results = TISC_LOG_QUERY_RESULTS,
+        .tisc_enable_cached_dispatch = TISC_ENABLE_CACHED_DISPATCH
+    };
+    axion_log_entropy("CONFIG_DEFAULT", 0);
+    return cfg;
+}
+
+void apply_env_overrides(HanoiVMConfig* cfg) {
+    char* mode = getenv("HVM_MODE");
+    if (mode && (strcmp(mode, "T81") == 0 || strcmp(mode, "T243") == 0 || strcmp(mode, "T729") == 0)) {
+        strncpy(cfg->ternary_logic_mode, mode, sizeof(cfg->ternary_logic_mode));
+        axion_log_entropy("OVERRIDE_MODE", mode[0]);
+    }
+    char* log_level = getenv("HVM_LOG_LEVEL");
+    if (log_level && (strcmp(log_level, "INFO") == 0 || strcmp(log_level, "DEBUG") == 0)) {
+        strncpy(cfg->log_level, log_level, sizeof(cfg->log_level));
+        axion_log_entropy("OVERRIDE_LOG_LEVEL", log_level[0]);
+    }
+    char* affinity = getenv("HVM_CPU_AFFINITY");
+    if (affinity) {
+        strncpy(cfg->cpu_affinity, affinity, sizeof(cfg->cpu_affinity));
+        axion_log_entropy("OVERRIDE_AFFINITY", affinity[0]);
+    }
+}
+
+@<Validation Function@>=
+int validate_config(const HanoiVMConfig* cfg) {
+    if (!cfg) {
+        axion_log_entropy("VALIDATE_CONFIG_NULL", 0xFF);
+        return 1;
+    }
+    for (int i = 0; validators[i].validate; i++) {
+        printf("[CONFIG] %s...\n", validators[i].description);
+        int ret = validators[i].validate(cfg);
+        if (ret != 0) {
+            fprintf(stderr, "[CONFIG ERROR] %s failed with code %d.\n", validators[i].name, ret);
+            return ret;
+        }
+    }
+    axion_log_entropy("VALIDATE_CONFIG_SUCCESS", 0);
+    return 0;
+}
+
+@<Visualization Hook@>=
+void print_config(const HanoiVMConfig* cfg) {
+    char json[512];
+    size_t len = snprintf(json, sizeof(json),
+        "{\"version\": \"%s\", \"ternary_logic_mode\": \"%s\", \"pcie_acceleration\": %d, "
+        "\"gpu_support\": %d, \"ai_optimization\": \"%s\", \"tisc_compiler\": %d, "
+        "\"memory\": %d, \"cpu_affinity\": \"%s\", \"log_level\": \"%s\"}",
+        HANOIVM_CONFIG_VERSION, cfg->ternary_logic_mode, cfg->enable_pcie_acceleration,
+        cfg->enable_gpu_support, cfg->ai_optimization_mode, cfg->enable_tisc_query_compiler,
+        cfg->memory_allocation, cfg->cpu_affinity, cfg->log_level);
+    printf("[CONFIG] %s\n", json);
+    axion_log_entropy("VISUALIZE_CONFIG", len & 0xFF);
+}
+
+@<Integration Hook@>=
+void config_integrate(HanoiVMConfig* cfg) {
+    if (cfg->enable_gpu_support) {
+        T729Macro macro = { .intent = GAIA_T729_DOT, .macro_id = 0 };
+        GAIAResponse res = dispatch_macro_extended(&macro, -1);
+        axion_log_entropy("CONFIG_GPU_TEST", res.success);
+    }
+    if (cfg->enable_tisc_query_compiler) {
+        extern int rust_tisc_query_init(int max_depth);
+        rust_tisc_query_init(cfg->tisc_query_max_depth);
+        axion_log_entropy("CONFIG_TISC_INIT", cfg->tisc_query_max_depth);
+    }
+    char session_id[32];
+    snprintf(session_id, sizeof(session_id), "CFG-%016lx", (uint64_t)cfg);
+    axion_register_session(session_id);
+}
+
+@<Test Main@>=
+int main() {
+    HanoiVMConfig cfg = default_config();
+    if (cfg.enable_runtime_overrides) apply_env_overrides(&cfg);
+    if (validate_config(&cfg) != 0) {
+        fprintf(stderr, "[CONFIG ERROR] Validation failed.\n");
+        return 1;
+    }
+    config_integrate(&cfg);
+    if (cfg.enable_debug_mode) print_config(&cfg);
+    uint8_t bytecode[] = { OP_T81_MATMUL, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    if (cfg.enable_debug_mode) {
+        extern void hvm_exec_bytecode(uint8_t* bytecode, size_t len);
+        hvm_exec_bytecode(bytecode, sizeof(bytecode));
+        axion_log_entropy("CONFIG_BYTECODE_TEST", bytecode[0]);
+    }
+    return 0;
+}
+

@@ -1,0 +1,217 @@
+@* disassembler.cweb | HanoiVM Bytecode Disassembler (v0.9.3)
+
+This module disassembles HanoiVM bytecode with T81 operand decoding, extended operand tags,
+verbose/JSON output, and session-aware entropy tracing. It integrates with `hanoivm_fsm.v` via PCIe/M.2,
+`axion-ai.cweb` via ioctls/debugfs, `hanoivm-core.cweb` and `hanoivm-runtime.cweb` via FFI,
+`hanoivm_vm.cweb`’s execution core, `hanoivm_firmware.cweb`’s firmware, `axion-gaia-interface.cweb`’s
+GPU dispatch, `axion_api.cweb`’s recursion optimization, `axion_gpu_serializer.cweb`’s GPU serialization,
+`bootstrap.cweb`’s bootstrap sequence, `config.cweb`’s configuration, `cuda_handle_request.cweb`’s CUDA backend,
+`disasm_hvm.cweb`’s type-aware disassembly, and `advanced_ops.cweb`/`advanced_ops_ext.cweb` opcodes.
+
+Enhancements:
+- Support for recursive opcodes (`RECURSE_FACT`) and T729 intents (`T81_MATMUL`).
+- Modular opcode and operand decoding table.
+- Entropy logging via `axion-ai.cweb`’s debugfs.
+- Session memory integration with `axion-ai.cweb`’s `axion_session_t`.
+- FFI interface to `hanoivm-core.cweb` (Rust) and `hanoivm-runtime.cweb` (C).
+- Secure validation for bytecode, opcodes, and operands.
+- Enhanced JSON output with type-aware operand details.
+- Support for `.hvm` test bytecode (`T81_MATMUL` + `TNN_ACCUM`).
+- Optimized for ternary bytecode disassembly.
+
+@c
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include "advanced_ops.h"
+#include "t81types.h"
+#include "t81_types_support.h"
+#include "axion-ai.h"
+#include "hanoivm_core.h"
+#include "hanoivm_runtime.h"
+#include "axion-gaia-interface.h"
+
+#define VERBOSE_DISASSEMBLE 1
+#define MAX_LOG_MSG 128
+#if VERBOSE_DISASSEMBLE
+  #define VERBOSE_PRINT(...) printf(__VA_ARGS__)
+  #define HEX_DUMP(buf, len) do {                    \
+        for (size_t i = 0; i < (len); i++) {         \
+            printf("%02X ", (buf)[i]);               \
+            if ((i+1) % 16 == 0) printf("\n");       \
+        }                                            \
+        if ((len) % 16 != 0) printf("\n");           \
+    } while(0)
+#else
+  #define VERBOSE_PRINT(...)
+  #define HEX_DUMP(buf, len)
+#endif
+
+uint8_t* hvm_code = NULL;
+size_t hvm_code_size = 0;
+
+@<Opcode Decoding Table@>=
+typedef struct {
+    uint8_t opcode;
+    const char* name;
+    int operand_count;
+    size_t operand_size;
+} OpcodeInfo;
+
+static OpcodeInfo opcodes[] = {
+    { OP_TFADD, "TFADD", 2, 18 },
+    { OP_TMMUL, "TMMUL", 2, 18 },
+    { OP_TNN_ACCUM, "TNN_ACCUM", 2, 18 },
+    { OP_T81_MATMUL, "T81_MATMUL", 2, 18 },
+    { OP_PUSH, "PUSH", 2, 18 },
+    { OP_RECURSE_FACT, "RECURSE_FACT", 1, 4 },
+    { 0x00, NULL, 0, 0 }
+};
+
+@<Opcode to String Translator@>=
+const char* opcode_to_str(uint8_t opcode) {
+    for (int i = 0; opcodes[i].name; i++) {
+        if (opcodes[i].opcode == opcode) return opcodes[i].name;
+    }
+    extern int rust_validate_opcode(uint8_t opcode);
+    if (rust_validate_opcode(opcode)) {
+        axion_log_entropy("DISASM_UNKNOWN_VALID", opcode);
+        return "VALID_UNKNOWN";
+    }
+    axion_log_entropy("DISASM_INVALID_OPCODE", opcode);
+    return "INVALID";
+}
+
+@<Fetch T81 Operand Function@>=
+uint81_t fetch_operand(const uint8_t* buf, size_t* offset, size_t buf_size) {
+    if (*offset + 8 >= buf_size) {
+        axion_log_entropy("DISASM_OPERAND_TRUNCATED", *offset);
+        return (uint81_t){0};
+    }
+    uint81_t out;
+    out.a = ((uint32_t)buf[*offset] << 24) | ((uint32_t)buf[*offset + 1] << 16) |
+            ((uint32_t)buf[*offset + 2] << 8) | buf[*offset + 3];
+    out.b = ((uint32_t)buf[*offset + 4] << 24) | ((uint32_t)buf[*offset + 5] << 16) |
+            ((uint32_t)buf[*offset + 6] << 8) | buf[*offset + 7];
+    out.c = buf[*offset + 8];
+    *offset += 9;
+    axion_log_entropy("DISASM_OPERAND_FETCH", out.c);
+    return out;
+}
+
+@<Operand Type Decoder@>=
+void decode_operand_type(uint81_t op, char* buf, size_t buf_len) {
+    if (op.c == T81_TAG_MATRIX) {
+        snprintf(buf, buf_len, "MATRIX [a:%u, b:%u]", op.a, op.b);
+    } else if (op.c == T81_TAG_BIGINT) {
+        snprintf(buf, buf_len, "BIGINT [val:%u]", op.a);
+    } else {
+        snprintf(buf, buf_len, "UNKNOWN [tag:%u]", op.c);
+    }
+    axion_log_entropy("DISASM_OPERAND_TYPE", op.c);
+}
+
+@<Disassemble Core Function@>=
+void disassemble_vm(const char* session_id) {
+    if (!hvm_code || hvm_code_size == 0) {
+        printf("[ERROR] No bytecode loaded.\n");
+        axion_log_entropy("DISASM_NO_CODE", 0xFF);
+        return;
+    }
+    if (session_id) axion_register_session(session_id);
+    printf("=== HanoiVM Disassembly ===\n");
+    size_t ip = 0;
+    while (ip < hvm_code_size) {
+        uint8_t opcode = hvm_code[ip++];
+        printf("%04zx: %-12s", ip - 1, opcode_to_str(opcode));
+        VERBOSE_PRINT(" [Raw: %02X]", opcode);
+        for (int i = 0; opcodes[i].name; i++) {
+            if (opcodes[i].opcode == opcode && opcodes[i].operand_count > 0) {
+                if (ip + opcodes[i].operand_size > hvm_code_size) {
+                    printf(" [truncated]\n");
+                    axion_log_entropy("DISASM_TRUNCATED", ip);
+                    return;
+                }
+                char op_buf[64];
+                for (int j = 0; j < opcodes[i].operand_count; j++) {
+                    uint81_t op = fetch_operand(&hvm_code[ip], &ip, hvm_code_size);
+                    decode_operand_type(op, op_buf, sizeof(op_buf));
+                    printf(" %s", op_buf);
+                    if (j < opcodes[i].operand_count - 1) printf(", ");
+                }
+                break;
+            }
+        }
+        printf("\n");
+        axion_log_entropy("DISASM_INSTRUCTION", opcode);
+    }
+}
+
+@<Disassemble JSON Output@>=
+void disassemble_vm_json(const char* session_id) {
+    if (!hvm_code || hvm_code_size == 0) return;
+    char filename[128];
+    snprintf(filename, sizeof(filename), "disasm_%s.json", session_id ? session_id : "unknown");
+    FILE* f = fopen(filename, "w");
+    if (!f) {
+        perror("fopen json");
+        axion_log_entropy("DISASM_JSON_OPEN_FAIL", errno);
+        return;
+    }
+    fprintf(f, "{\n  \"session\": \"%s\",\n  \"instructions\": [\n", session_id ? session_id : "unknown");
+    size_t ip = 0;
+    int count = 0;
+    while (ip < hvm_code_size) {
+        uint8_t opcode = hvm_code[ip++];
+        uint81_t a = {0}, b = {0};
+        char a_buf[64], b_buf[64];
+        if (ip + 17 < hvm_code_size) {
+            a = fetch_operand(&hvm_code[ip], &ip, hvm_code_size);
+            b = fetch_operand(&hvm_code[ip], &ip, hvm_code_size);
+            decode_operand_type(a, a_buf, sizeof(a_buf));
+            decode_operand_type(b, b_buf, sizeof(b_buf));
+        }
+        if (count++ > 0) fprintf(f, ",\n");
+        fprintf(f, "    {\n      \"ip\": %zu,\n      \"opcode\": \"%s\",\n      \"operand_a\": \"%s\",\n      \"operand_b\": \"%s\",\n      \"entropy_warning\": %s\n    }",
+                ip - 1, opcode_to_str(opcode), a_buf, b_buf, (a.c > 240 || b.c > 240) ? "true" : "false");
+    }
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
+    printf("JSON disassembly written to %s\n", filename);
+    axion_log_entropy("DISASM_JSON_COMPLETE", count & 0xFF);
+}
+
+@<Integration Hook@>=
+void disasm_integrate(const char* session_id) {
+    disassemble_vm(session_id);
+    disassemble_vm_json(session_id);
+    GaiaRequest req = { .tbin = hvm_code, .tbin_len = hvm_code_size, .intent = GAIA_T729_DOT };
+    GaiaResponse res = cuda_handle_request(req);
+    axion_log_entropy("DISASM_INTEGRATE_CUDA", res.symbolic_status);
+}
+
+@<Optional: Disassemble to File@>=
+void disassemble_to_file(const char* filename) {
+    FILE* f = fopen(filename, "w");
+    if (!f) {
+        perror("fopen disassembly file");
+        axion_log_entropy("DISASM_FILE_OPEN_FAIL", errno);
+        return;
+    }
+    FILE* orig = stdout;
+    stdout = f;
+    disassemble_vm(NULL);
+    stdout = orig;
+    fclose(f);
+    printf("Disassembly written to %s\n", filename);
+    axion_log_entropy("DISASM_FILE_COMPLETE", 0);
+}
+
+@<Header Export@>=
+@h
+void disassemble_vm(const char* session_id);
+void disassemble_to_file(const char* filename);
+void disassemble_to_file_with_session(const char* base, const char* session_id);
+void disassemble_vm_json(const char* session_id);

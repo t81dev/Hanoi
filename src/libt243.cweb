@@ -1,0 +1,574 @@
+@* libt243.cweb | T243 Logic Tree Builder, Optimizer, and Analyzer (v0.9.4)
+   This module constructs, manipulates, and optimizes ternary logic trees based on Base-243 units,
+   supporting T81/T243/T729 opcodes, type-aware operands, session-aware entropy logging,
+   and GPU/PCIe synchronization. It integrates with multiple HanoiVM components, including
+   `hanoivm_runtime`, `axion-ai`, `hanoivm-core`, and `axion-gaia-interface`.
+
+   Enhancements (v0.9.4):
+   - Comprehensive error handling with `T243Error`.
+   - JSON serialization/deserialization for logic trees.
+   - Advanced optimization (constant folding, dead branch elimination).
+   - Validation for nodes, type tags, and session IDs.
+   - Enhanced visualization with DOT graph generation.
+   - Evaluation result caching and batched PCIe commands.
+   - T729 macro integration via `to_t729_macro`.
+   - Unit tests for new functionality.
+
+@c
+use crate::libt81::{T81Digit, T81Number};
+use crate::libt729::{T729Macro}; // New dependency for T729 integration
+use log::{error, info};
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::fmt;
+extern crate axion_gaia;
+
+#[link(name = "hanoivm_runtime")]
+extern "C" {
+    fn validate_t243_node(node_type: u8, value: u8) -> i32;
+}
+
+pub const T81_TAG_BIGINT: u8 = 0x01;
+pub const T81_TAG_MATRIX: u8 = 0x04;
+pub const T81_TAG_VECTOR: u8 = 0x05;
+
+@<Error Handling@>=
+#[derive(Debug)]
+pub enum T243Error {
+    InvalidDigit(u8),
+    InvalidNodeType(u8),
+    InvalidTag(u8),
+    BytecodeTooShort(usize),
+    SerializationError(String),
+    SessionError(String),
+    EvaluationError(String),
+}
+
+impl std::fmt::Display for T243Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            T243Error::InvalidDigit(val) => write!(f, "Invalid T243 digit: {}", val),
+            T243Error::InvalidNodeType(ty) => write!(f, "Invalid node type: {}", ty),
+            T243Error::InvalidTag(tag) => write!(f, "Invalid type tag: {}", tag),
+            T243Error::BytecodeTooShort(len) => write!(f, "Bytecode too short: {} bytes", len),
+            T243Error::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            T243Error::SessionError(msg) => write!(f, "Session error: {}", msg),
+            T243Error::EvaluationError(msg) => write!(f, "Evaluation error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for T243Error {}
+@#
+
+@<T243 Digit and Node Definitions@>=
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct T243Digit(pub u8); // Valid values: 0–242
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum T243Node {
+    Operand(T243Digit, u8), // Digit with type tag (e.g., T81_TAG_VECTOR)
+    Branch(Box<T243Node>, Box<T243Node>, Box<T243Node>, u8), // Ternary branch
+    Call(String, Vec<T243Node>), // Symbolic function call
+}
+@#
+
+@<T243 Logic Tree Definition@>=
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct T243LogicTree {
+    pub root: T243Node,
+    pub name: Option<String>,
+    pub session_id: String,
+    #[serde(skip)]
+    eval_cache: HashMap<String, T81Number>, // Cache for evaluation results
+}
+@#
+
+@<Implementations for T243Digit@>=
+impl T243Digit {
+    /// Creates a new T243 digit with validation.
+    pub fn new(val: u8) -> Result<Self, T243Error> {
+        if val >= 243 {
+            axion_gaia::log_entropy("T243_DIGIT_OUT_OF_RANGE", val as u64);
+            return Err(T243Error::InvalidDigit(val));
+        }
+        unsafe {
+            if validate_t243_node(0, val) != 0 {
+                axion_gaia::log_entropy("INVALID_T243_DIGIT", val as u64);
+                return Err(T243Error::InvalidDigit(val));
+            }
+        }
+        Ok(T243Digit(val))
+    }
+
+    /// Combines two T81 digits into a T243 digit.
+    pub fn from_t81_pair(a: &T81Digit, b: &T81Digit) -> Result<Self, T243Error> {
+        if a.0 >= 81 || b.0 >= 81 {
+            axion_gaia::log_entropy("INVALID_T81_DIGIT", std::cmp::max(a.0, b.0) as u64);
+            return Err(T243Error::InvalidDigit(std::cmp::max(a.0, b.0)));
+        }
+        let combined = a.0 as u16 + (b.0 as u16 * 81);
+        T243Digit::new((combined % 243) as u8)
+    }
+
+    /// Converts to 5 trits.
+    pub fn to_trits(&self) -> [u8; 5] {
+        let mut value = self.0;
+        let mut trits = [0; 5];
+        for i in 0..5 {
+            trits[i] = value % 3;
+            value /= 3;
+        }
+        trits
+    }
+}
+@#
+
+@<Tree Construction@>=
+impl T243LogicTree {
+    /// Creates a new logic tree with a unique session ID.
+    pub fn new(root: T243Node, name: Option<String>) -> Result<Self, T243Error> {
+        let session_id = format!("T243-{:016x}", &root as *const T243Node as u64);
+        if axion_gaia::session_exists(&session_id) {
+            return Err(T243Error::SessionError(format!("Duplicate session ID: {}", session_id)));
+        }
+        axion_gaia::register_session(&session_id);
+        axion_gaia::log_entropy("TREE_CREATED", 0);
+        Ok(T243LogicTree {
+            root,
+            name,
+            session_id,
+            eval_cache: HashMap::new(),
+        })
+    }
+
+    /// Constructs a tree from bytecode.
+    pub fn from_bytecode(bytecode: &[u8], name: Option<String>) -> Result<Self, T243Error> {
+        if bytecode.len() < 2 {
+            axion_gaia::log_entropy("BYTECODE_TOO_SHORT", bytecode.len() as u64);
+            return Err(T243Error::BytecodeTooShort(bytecode.len()));
+        }
+        let digit = T243Digit::new(bytecode[0])?;
+        if ![T81_TAG_BIGINT, T81_TAG_MATRIX, T81_TAG_VECTOR].contains(&bytecode[1]) {
+            axion_gaia::log_entropy("INVALID_TYPE_TAG", bytecode[1] as u64);
+            return Err(T243Error::InvalidTag(bytecode[1]));
+        }
+        let node = T243Node::Operand(digit, bytecode[1]);
+        T243LogicTree::new(node, name)
+    }
+}
+@#
+
+@<Optimization Methods@>=
+impl T243LogicTree {
+    /// Optimizes the tree with constant folding and dead branch elimination.
+    pub fn optimize(&mut self) -> Result<(), T243Error> {
+        self.root = Self::optimize_node(self.root.clone())?;
+        axion_gaia::log_entropy("TREE_OPTIMIZED", 0);
+        Ok(())
+    }
+
+    fn optimize_node(node: T243Node) -> Result<T243Node, T243Error> {
+        match node {
+            T243Node::Branch(z, o, t, tag) => {
+                let opt_z = Self::optimize_node(*z)?;
+                let opt_o = Self::optimize_node(*o)?;
+                let opt_t = Self::optimize_node(*t)?;
+                // Constant folding for selector
+                if let T243Node::Operand(d, _) = &opt_z {
+                    let selector = d.0 % 3;
+                    axion_gaia::log_entropy("CONSTANT_SELECTOR", selector as u64);
+                    return Ok(match selector {
+                        0 => opt_z,
+                        1 => opt_o,
+                        2 => opt_t,
+                        _ => unreachable!(),
+                    });
+                }
+                // Dead branch elimination
+                if opt_z == opt_o && opt_o == opt_t {
+                    axion_gaia::log_entropy("BRANCH_SIMPLIFIED", tag as u64);
+                    Ok(opt_z)
+                } else {
+                    Ok(T243Node::Branch(Box::new(opt_z), Box::new(opt_o), Box::new(opt_t), tag))
+                }
+            }
+            T243Node::Call(name, args) => {
+                let opt_args = args.into_iter()
+                    .map(Self::optimize_node)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(T243Node::Call(name, opt_args))
+            }
+            T243Node::Operand(d, tag) => {
+                if unsafe { validate_t243_node(1, tag) != 0 } {
+                    axion_gaia::log_entropy("INVALID_OPERAND_TAG", tag as u64);
+                    return Err(T243Error::InvalidTag(tag));
+                }
+                Ok(T243Node::Operand(d, tag))
+            }
+        }
+    }
+}
+@#
+
+@<Evaluation Methods@>=
+impl T243LogicTree {
+    /// Evaluates the tree, using cache if available.
+    pub fn evaluate(&mut self) -> Result<T81Number, T243Error> {
+        let cache_key = format!("{:?}", self.root);
+        if let Some(cached) = self.eval_cache.get(&cache_key) {
+            axion_gaia::log_entropy("CACHE_HIT", 1);
+            return Ok(cached.clone());
+        }
+
+        let result = self.eval_node(&self.root)?;
+        if matches!(&self.root, T243Node::Branch(_, _, _, tag) if *tag == T81_TAG_MATRIX) {
+            let req = axion_gaia::GaiaRequest {
+                tbin: &result.digits.iter().map(|d| d.0).collect::<Vec<u8>>(),
+                tbin_len: result.digits.len(),
+                intent: axion_gaia::GaiaIntent::T729_DOT,
+            };
+            let res = axion_gaia::handle_request(req);
+            let number = T81Number::from_digits(res.updated_macro.iter().map(|&v| T81Digit(v)).collect(), false);
+            self.eval_cache.insert(cache_key, number.clone());
+            axion_gaia::log_entropy("TREE_EVALUATED", number.digits.len() as u64);
+            Ok(number)
+        } else {
+            self.eval_cache.insert(cache_key, result.clone());
+            axion_gaia::log_entropy("TREE_EVALUATED", result.digits.len() as u64);
+            Ok(result)
+        }
+    }
+
+    fn eval_node(&self, node: &T243Node) -> Result<T81Number, T243Error> {
+        match node {
+            T243Node::Operand(d, tag) => {
+                if unsafe { validate_t243_node(1, *tag) != 0 } {
+                    axion_gaia::log_entropy("INVALID_OPERAND_TAG", *tag as u64);
+                    return Err(T243Error::InvalidTag(*tag));
+                }
+                Ok(T81Number::from_digits(vec![T81Digit(d.0 % 81)], false))
+            }
+            T243Node::Branch(z, o, t, _) => {
+                let selector = self.eval_node(z)?.digits.get(0).map(|d| d.0 % 3).unwrap_or(0);
+                match selector {
+                    0 => self.eval_node(z),
+                    1 => self.eval_node(o),
+                    2 => self.eval_node(t),
+                    _ => Ok(T81Number::zero()),
+                }
+            }
+            T243Node::Call(_, args) => {
+                let sum = args.iter()
+                    .map(|arg| self.eval_node(arg))
+                    .try_fold(T81Number::zero(), |a, b| b.map(|b| a + b))?;
+                Ok(sum)
+            }
+        }
+    }
+}
+@#
+
+@<Display Implementation@>=
+impl fmt::Display for T243LogicTree {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "LogicTree: {}\n", self.name.clone().unwrap_or("anonymous".to_string()))?;
+        self.render_node(&self.root, f, 0)?;
+        axion_gaia::log_entropy("TREE_DISPLAYED", self.session_id.len() as u64);
+        Ok(())
+    }
+}
+
+impl T243LogicTree {
+    fn render_node(&self, node: &T243Node, f: &mut fmt::Formatter, depth: usize) -> fmt::Result {
+        let indent = "  ".repeat(depth);
+        match node {
+            T243Node::Operand(d, tag) => writeln!(f, "{}Operand({} : Tag={})", indent, d.0, tag),
+            T243Node::Branch(z, o, t, tag) => {
+                writeln!(f, "{}Branch(Tag={}):", indent, tag)?;
+                self.render_node(z, f, depth + 1)?;
+                self.render_node(o, f, depth + 1)?;
+                self.render_node(t, f, depth + 1)
+            }
+            T243Node::Call(name, args) => {
+                writeln!(f, "{}Call: {}", indent, name)?;
+                for arg in args {
+                    self.render_node(arg, f, depth + 1)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+@#
+
+@<Transformation Methods@>=
+impl T243LogicTree {
+    pub fn transform<F>(&mut self, f: F) -> Result<(), T243Error>
+    where
+        F: Fn(&T243Node) -> Result<T243Node, T243Error>,
+    {
+        self.root = self.transform_node(&self.root, &f)?;
+        axion_gaia::log_entropy("TREE_TRANSFORMED", 0);
+        Ok(())
+    }
+
+    fn transform_node<F>(&self, node: &T243Node, f: &F) -> Result<T243Node, T243Error>
+    where
+        F: Fn(&T243Node) -> Result<T243Node, T243Error>,
+    {
+        let transformed = f(node)?;
+        match transformed {
+            T243Node::Branch(z, o, t, tag) => {
+                let new_z = self.transform_node(&z, f)?;
+                let new_o = self.transform_node(&o, f)?;
+                let new_t = self.transform_node(&t, f)?;
+                Ok(T243Node::Branch(Box::new(new_z), Box::new(new_o), Box::new(new_t), tag))
+            }
+            T243Node::Call(name, args) => {
+                let new_args = args.into_iter()
+                    .map(|arg| self.transform_node(&arg, f))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(T243Node::Call(name, new_args))
+            }
+            T243Node::Operand(d, tag) => {
+                if unsafe { validate_t243_node(1, tag) != 0 } {
+                    return Err(T243Error::InvalidTag(tag));
+                }
+                Ok(T243Node::Operand(d, tag))
+            }
+        }
+    }
+}
+@#
+
+@<Visualization Hook@>=
+impl T243LogicTree {
+    /// Generates a DOT graph representation.
+    pub fn visualize(&self) -> Result<String, T243Error> {
+        let mut dot = String::from("digraph T243LogicTree {\n");
+        dot.push_str("  node [shape=box];\n");
+        self.render_dot(&self.root, &mut dot, 0)?;
+        dot.push_str("}\n");
+        axion_gaia::log_entropy("TREE_VISUALIZED", dot.len() as u64);
+        let req = axion_gaia::GaiaRequest {
+            tbin: dot.as_bytes(),
+            tbin_len: dot.len(),
+            intent: axion_gaia::GaiaIntent::T729_DOT,
+        };
+        let _ = axion_gaia::handle_request(req);
+        Ok(dot)
+    }
+
+    fn render_dot(&self, node: &T243Node, dot: &mut String, id: usize) -> Result<usize, T243Error> {
+        let my_id = id;
+        match node {
+            T243Node::Operand(d, tag) => {
+                dot.push_str(&format!("  n{} [label=\"Operand({} : Tag={})\"];\n", my_id, d.0, tag));
+                Ok(my_id + 1)
+            }
+            T243Node::Branch(z, o, t, tag) => {
+                dot.push_str(&format!("  n{} [label=\"Branch(Tag={})\"];\n", my_id, tag));
+                let next_id = self.render_dot(z, dot, my_id + 1)?;
+                dot.push_str(&format!("  n{} -> n{} [label=\"0\"];\n", my_id, my_id + 1));
+                let next_id = self.render_dot(o, dot, next_id)?;
+                dot.push_str(&format!("  n{} -> n{} [label=\"1\"];\n", my_id, next_id - 1));
+                let next_id = self.render_dot(t, dot, next_id)?;
+                dot.push_str(&format!("  n{} -> n{} [label=\"2\"];\n", my_id, next_id - 1));
+                Ok(next_id)
+            }
+            T243Node::Call(name, args) => {
+                dot.push_str(&format!("  n{} [label=\"Call({})\"];\n", my_id, name));
+                let mut next_id = my_id + 1;
+                for (i, arg) in args.iter().enumerate() {
+                    next_id = self.render_dot(arg, dot, next_id)?;
+                    dot.push_str(&format!("  n{} -> n{} [label=\"arg{}\"];\n", my_id, next_id - 1, i));
+                }
+                Ok(next_id)
+            }
+        }
+    }
+
+    /// Serializes tree with session metadata.
+    pub fn to_json_with_metadata(&self) -> Result<String, T243Error> {
+        let metadata = serde_json::json!({
+            "tree": self,
+            "session_id": self.session_id,
+            "entropy_logs": axion_gaia::get_entropy_logs(&self.session_id),
+        });
+        serde_json::to_string(&metadata)
+            .map_err(|e| T243Error::SerializationError(e.to_string()))
+    }
+}
+@#
+
+@<Serialization Methods@>=
+impl T243LogicTree {
+    /// Saves the tree to a JSON file.
+    pub fn save(&self, path: &str) -> Result<(), T243Error> {
+        let file = File::create(path)
+            .map_err(|e| T243Error::SerializationError(e.to_string()))?;
+        serde_json::to_writer(file, self)
+            .map_err(|e| T243Error::SerializationError(e.to_string()))?;
+        axion_gaia::log_entropy("TREE_SAVED", path.len() as u64);
+        info!("Saved tree to {}", path);
+        Ok(())
+    }
+
+    /// Loads a tree from a JSON file.
+    pub fn load(path: &str) -> Result<Self, T243Error> {
+        let mut file = File::open(path)
+            .map_err(|e| T243Error::SerializationError(e.to_string()))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|e| T243Error::SerializationError(e.to_string()))?;
+        let mut tree: T243LogicTree = serde_json::from_str(&contents)
+            .map_err(|e| T243Error::SerializationError(e.to_string()))?;
+        // Reinitialize session
+        tree.session_id = format!("T243-{:016x}", &tree.root as *const T243Node as u64);
+        if axion_gaia::session_exists(&tree.session_id) {
+            return Err(T243Error::SessionError(format!("Duplicate session ID: {}", tree.session_id)));
+        }
+        axion_gaia::register_session(&tree.session_id);
+        axion_gaia::log_entropy("TREE_LOADED", path.len() as u64);
+        info!("Loaded tree from {}", path);
+        Ok(tree)
+    }
+}
+@#
+
+@<Integration Hook@>=
+impl T243LogicTree {
+    /// Integrates with PCIe, batching commands for efficiency.
+    pub fn integrate_with_pcie(&self) -> Result<(), T243Error> {
+        if let Ok(fd) = std::fs::File::open("/dev/hvm0") {
+            let mut commands = Vec::new();
+            self.collect_pcie_commands(&self.root, &mut commands)?;
+            for cmd in commands {
+                unsafe {
+                    hvm_pcie_driver::hvm_write(fd.as_raw_fd(), &cmd);
+                }
+                axion_gaia::log_entropy("PCIE_COMMAND", cmd.opcode as u64);
+            }
+            Ok(())
+        } else {
+            Err(T243Error::EvaluationError("Failed to open /dev/hvm0".to_string()))
+        }
+    }
+
+    fn collect_pcie_commands(&self, node: &T243Node, commands: &mut Vec<hvm_pcie_driver::HvmExecCmd>) -> Result<(), T243Error> {
+        match node {
+            T243Node::Operand(d, tag) => {
+                if *tag == T81_TAG_MATRIX {
+                    commands.push(hvm_pcie_driver::HvmExecCmd {
+                        opcode: 0x21, // T81_MATMUL
+                        tag: *tag,
+                        operand: d.0 as u32,
+                    });
+                }
+            }
+            T243Node::Branch(z, o, t, _) => {
+                self.collect_pcie_commands(z, commands)?;
+                self.collect_pcie_commands(o, commands)?;
+                self.collect_pcie_commands(t, commands)?;
+            }
+            T243Node::Call(_, args) => {
+                for arg in args {
+                    self.collect_pcie_commands(arg, commands)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Converts the tree to a T729 macro.
+    pub fn to_t729_macro(&self) -> T729Macro {
+        axion_gaia::log_entropy("T729_MACRO_CREATED", 0);
+        T729Macro::CompressedTree(self.clone())
+    }
+}
+@#
+
+@<Testing Methods@>=
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_digit_creation() {
+        assert!(T243Digit::new(242).is_ok());
+        assert!(matches!(T243Digit::new(243), Err(T243Error::InvalidDigit(243))));
+    }
+
+    #[test]
+    fn test_tree_creation() {
+        let digit = T243Digit::new(42).unwrap();
+        let node = T243Node::Operand(digit, T81_TAG_BIGINT);
+        let tree = T243LogicTree::new(node, Some("test".to_string())).unwrap();
+        assert_eq!(tree.name, Some("test".to_string()));
+        assert!(!tree.session_id.is_empty());
+    }
+
+    #[test]
+    fn test_bytecode_parsing() {
+        let bytecode = vec![42, T81_TAG_MATRIX];
+        let tree = T243LogicTree::from_bytecode(&bytecode, None).unwrap();
+        if let T243Node::Operand(d, tag) = tree.root {
+            assert_eq!(d.0, 42);
+            assert_eq!(tag, T81_TAG_MATRIX);
+        } else {
+            panic!("Expected Operand node");
+        }
+        assert!(matches!(
+            T243LogicTree::from_bytecode(&[42], None),
+            Err(T243Error::BytecodeTooShort(1))
+        ));
+    }
+
+    #[test]
+    fn test_optimization() {
+        let digit = T243Digit::new(0).unwrap();
+        let node = T243Node::Operand(digit, T81_TAG_BIGINT);
+        let branch = T243Node::Branch(
+            Box::new(node.clone()),
+            Box::new(node.clone()),
+            Box::new(node.clone()),
+            T81_TAG_VECTOR,
+        );
+        let mut tree = T243LogicTree::new(branch, None).unwrap();
+        tree.optimize().unwrap();
+        assert_eq!(tree.root, node);
+    }
+
+    #[test]
+    fn test_serialization() {
+        let digit = T243Digit::new(42).unwrap();
+        let node = T243Node::Operand(digit, T81_TAG_BIGINT);
+        let tree = T243LogicTree::new(node, Some("test".to_string())).unwrap();
+        tree.save("test_tree.json").unwrap();
+        let loaded = T243LogicTree::load("test_tree.json").unwrap();
+        assert_eq!(tree.root, loaded.root);
+        assert_eq!(tree.name, loaded.name);
+    }
+
+    #[test]
+    fn test_visualization() {
+        let digit = T243Digit::new(42).unwrap();
+        let node = T243Node::Operand(digit, T81_TAG_BIGINT);
+        let tree = T243LogicTree::new(node, None).unwrap();
+        let dot = tree.visualize().unwrap();
+        assert!(dot.contains("digraph T243LogicTree"));
+        assert!(dot.contains("Operand(42 : Tag=1)"));
+    }
+}
+@#
+
+@<Module Definition@>=
+pub mod libt243 {
+    pub use super::{T243Digit, T243Node, T243LogicTree, T243Error};
+}
+@#
+
+@* End of libt243.cweb

@@ -1,0 +1,331 @@
+@* libt729.cweb: T729 Macro-Instruction & JIT Optimizer Layer (Enhanced Version)
+   This module encodes the deepest recursive layer of HanoiVM, representing compressed
+   logic sequences or symbolic expressions in 6-trit units (3^6 = 729). T729Digits are
+   interpreted by Axion AI or JIT-compiled into T243 or T81 sequences.
+
+   Enhancements:
+     - Error handling with `T729Error` and `Result`.
+     - Macro registry serialization to/from JSON.
+     - JIT compilation stub for T243 sequences.
+     - Input validation and safety checks.
+     - Extended debugging with macro metadata.
+     - Execution result caching for performance.
+
+   Dependencies: `libt243` (T243Digit, T243LogicTree), `libt81` (T81Number).
+@#
+
+@<Include Dependencies@>=
+use crate::libt243::{T243Digit, T243LogicTree};
+use crate::libt81::T81Number;
+use log::{error, info};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::time::{Instant};
+@#
+
+@<Error Handling@>=
+#[derive(Debug)]
+pub enum T729Error {
+    InvalidDigit(u16),
+    MacroNotFound(T729Digit),
+    InvalidT243Digit(u16),
+    InvalidInputSize(usize),
+    SerializationError(String),
+    ExecutionError(String),
+}
+
+impl std::fmt::Display for T729Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            T729Error::InvalidDigit(val) => write!(f, "Invalid T729 digit: {}", val),
+            T729Error::MacroNotFound(digit) => write!(f, "Macro not found for digit: {}", digit),
+            T729Error::InvalidT243Digit(val) => write!(f, "Invalid T243 digit: {}", val),
+            T729Error::InvalidInputSize(size) => write!(f, "Invalid input size: {}", size),
+            T729Error::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            T729Error::ExecutionError(msg) => write!(f, "Execution error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for T729Error {}
+@#
+
+@<T729 Digit and Macro Definitions@>=
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct T729Digit(pub u16); // Valid values: 0–728
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum T729Macro {
+    CompressedTree(T243LogicTree),
+    InlineOp(String), // Placeholder: stores function name for serialization
+    StaticLiteral(T81Number),
+}
+
+pub struct T729MacroEngine {
+    registry: HashMap<T729Digit, T729Macro>,
+    cache: HashMap<T729Digit, T81Number>, // Execution result cache
+    cache_limit: usize, // Max cache entries
+    macro_stats: HashMap<T729Digit, MacroStats>, // Debugging stats
+}
+
+#[derive(Debug)]
+struct MacroStats {
+    hit_count: u64,
+    last_execution_time: Option<std::time::Duration>,
+    size_bytes: usize, // Approximate size
+}
+@#
+
+@<Implementations for T729Digit@>=
+impl T729Digit {
+    /// Creates a new valid T729 digit, returning an error if invalid.
+    pub fn new(val: u16) -> Result<Self, T729Error> {
+        if val < 729 {
+            Ok(T729Digit(val))
+        } else {
+            Err(T729Error::InvalidDigit(val))
+        }
+    }
+
+    /// Converts three T243 digits into a T729Digit (mod 729).
+    pub fn from_t243_sequence(a: &T243Digit, b: &T243Digit, c: &T243Digit) -> Result<Self, T729Error> {
+        for &digit in &[a.0, b.0, c.0] {
+            if digit >= 243 {
+                return Err(T729Error::InvalidT243Digit(digit));
+            }
+        }
+        let index = a.0 as u32 + (b.0 as u32 * 243) + (c.0 as u32 * 243 * 243);
+        T729Digit::new((index % 729) as u16)
+    }
+
+    /// Returns the raw index.
+    pub fn index(&self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl std::fmt::Display for T729Digit {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut value = self.0;
+        let mut trits = [0; 6];
+        for i in 0..6 {
+            trits[i] = value % 3;
+            value /= 3;
+        }
+        write!(f, "T729({}): [{}]", self.0, trits.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" "))
+    }
+}
+@#
+
+@<Implementations for T729MacroEngine@>=
+impl T729MacroEngine {
+    /// Creates a new macro engine with a cache limit.
+    pub fn new() -> Self {
+        T729MacroEngine {
+            registry: HashMap::new(),
+            cache: HashMap::new(),
+            cache_limit: 1000, // Configurable limit
+            macro_stats: HashMap::new(),
+        }
+    }
+
+    /// Registers a static literal macro.
+    pub fn register_literal(&mut self, digit: T729Digit, value: T81Number) -> Result<(), T729Error> {
+        self.register_macro(digit, T729Macro::StaticLiteral(value))
+    }
+
+    /// Registers a compressed T243 logic tree.
+    pub fn register_tree(&mut self, digit: T729Digit, tree: T243LogicTree) -> Result<(), T729Error> {
+        self.register_macro(digit, T729Macro::CompressedTree(tree))
+    }
+
+    /// Registers a compiled inline function (stores name for serialization).
+    pub fn register_inline_op(&mut self, digit: T729Digit, op_name: &str) -> Result<(), T729Error> {
+        self.register_macro(digit, T729Macro::InlineOp(op_name.to_string()))
+    }
+
+    /// Internal method to register a macro and update stats.
+    fn register_macro(&mut self, digit: T729Digit, macro_def: T729Macro) -> Result<(), T729Error> {
+        let size_bytes = match &macro_def {
+            T729Macro::StaticLiteral(n) => std::mem::size_of_val(n),
+            T729Macro::CompressedTree(t) => std::mem::size_of_val(t), // Approximate
+            T729Macro::InlineOp(s) => s.len(),
+        };
+        self.registry.insert(digit, macro_def);
+        self.macro_stats.insert(digit, MacroStats {
+            hit_count: 0,
+            last_execution_time: None,
+            size_bytes,
+        });
+        info!("Registered macro for digit {}", digit);
+        Ok(())
+    }
+
+    /// Unregisters a macro.
+    pub fn unregister_macro(&mut self, digit: T729Digit) -> Result<(), T729Error> {
+        if self.registry.remove(&digit).is_some() {
+            self.macro_stats.remove(&digit);
+            self.cache.remove(&digit);
+            info!("Unregistered macro for digit {}", digit);
+            Ok(())
+        } else {
+            Err(T729Error::MacroNotFound(digit))
+        }
+    }
+
+    /// Updates an existing macro.
+    pub fn update_macro(&mut self, digit: T729Digit, new_macro: T729Macro) -> Result<(), T729Error> {
+        if self.registry.contains_key(&digit) {
+            self.register_macro(digit, new_macro)?;
+            info!("Updated macro for digit {}", digit);
+            Ok(())
+        } else {
+            Err(T729Error::MacroNotFound(digit))
+        }
+    }
+
+    /// Lists all registered macros with detailed stats.
+    pub fn list_macros(&self) -> String {
+        let mut output = String::new();
+        for (digit, mac) in &self.registry {
+            let mac_desc = match mac {
+                T729Macro::StaticLiteral(n) => format!("StaticLiteral({})", n),
+                T729Macro::CompressedTree(tree) => format!("CompressedTree({})", tree),
+                T729Macro::InlineOp(name) => format!("InlineOp({})", name),
+            };
+            let stats = self.macro_stats.get(digit).unwrap();
+            output.push_str(&format!(
+                "{} => {} (size: {} bytes, hits: {}, last exec: {})\n",
+                digit,
+                mac_desc,
+                stats.size_bytes,
+                stats.hit_count,
+                stats.last_execution_time.map_or("none".to_string(), |d| format!("{:?}", d))
+            ));
+        }
+        if output.is_empty() {
+            output = "No macros registered.\n".to_string();
+        }
+        output
+    }
+
+    /// Retrieves detailed info for a single macro.
+    pub fn get_macro_info(&self, digit: T729Digit) -> Result<String, T729Error> {
+        let mac = self.registry.get(&digit).ok_or(T729Error::MacroNotFound(digit))?;
+        let stats = self.macro_stats.get(&digit).ok_or(T729Error::MacroNotFound(digit))?;
+        let mac_desc = match mac {
+            T729Macro::StaticLiteral(n) => format!("StaticLiteral({})", n),
+            T729Macro::CompressedTree(tree) => format!("CompressedTree({})", tree),
+            T729Macro::InlineOp(name) => format!("InlineOp({})", name),
+        };
+        Ok(format!(
+            "Macro {}: {} (size: {} bytes, hits: {}, last exec: {})",
+            digit,
+            mac_desc,
+            stats.size_bytes,
+            stats.hit_count,
+            stats.last_execution_time.map_or("none".to_string(), |d| format!("{:?}", d))
+        ))
+    }
+
+    /// Executes a T729Digit, using cache if available.
+    pub fn execute(&self, digit: T729Digit, inputs: Vec<T81Number>) -> Result<T81Number, T729Error> {
+        // Check cache
+        if let Some(cached) = self.cache.get(&digit) {
+            self.update_stats(digit, None); // Update hit count
+            return Ok(cached.clone());
+        }
+
+        let start_time = Instant::now();
+        let result = match self.registry.get(&digit) {
+            Some(T729Macro::StaticLiteral(n)) => Ok(n.clone()),
+            Some(T729Macro::CompressedTree(tree)) => Ok(tree.evaluate()),
+            Some(T729Macro::InlineOp(name)) => {
+                // Placeholder: assumes a predefined op map
+                let op_map: HashMap<&str, fn(Vec<T81Number>) -> T81Number> = HashMap::new();
+                let op = op_map.get(name.as_str()).ok_or_else(|| T729Error::ExecutionError(format!("Unknown op: {}", name)))?;
+                if inputs.len() != 2 {
+                    Err(T729Error::InvalidInputSize(inputs.len()))
+                } else {
+                    Ok(op(inputs))
+                }
+            }
+            None => {
+                error!("Macro for digit {} not found", digit);
+                Ok(T81Number::zero())
+            }
+        }?;
+
+        // Update stats and cache
+        let duration = start_time.elapsed();
+        self.update_stats(digit, Some(duration));
+        if self.cache.len() < self.cache_limit {
+            self.cache.insert(digit, result.clone());
+        }
+
+        #[cfg(feature = "verbose_t729")]
+        info!("Executed digit {} in {:?}", digit, duration);
+
+        Ok(result)
+    }
+
+    /// Updates macro execution statistics.
+    fn update_stats(&mut self, digit: T729Digit, duration: Option<std::time::Duration>) {
+        let stats = self.macro_stats.entry(digit).or_insert(MacroStats {
+            hit_count: 0,
+            last_execution_time: None,
+            size_bytes: 0,
+        });
+        stats.hit_count += 1;
+        if let Some(d) = duration {
+            stats.last_execution_time = Some(d);
+        }
+    }
+
+    /// JIT-compiles a macro to a T243 sequence (stub).
+    pub fn jit_compile(&self, digit: T729Digit) -> Result<Vec<T243Digit>, T729Error> {
+        let mac = self.registry.get(&digit).ok_or(T729Error::MacroNotFound(digit))?;
+        match mac {
+            T729Macro::StaticLiteral(n) => {
+                // Placeholder: convert T81Number to T243 digits
+                Ok(vec![T243Digit(0)]) // Stub
+            }
+            T729Macro::CompressedTree(tree) => {
+                // Placeholder: flatten tree to T243 sequence
+                Ok(tree.flatten()) // Assumes T243LogicTree has a flatten method
+            }
+            T729Macro::InlineOp(_) => {
+                Err(T729Error::ExecutionError("JIT compilation of InlineOp not supported".to_string()))
+            }
+        }
+    }
+
+    /// Saves the macro registry to a JSON file.
+    pub fn save_registry(&self, path: &str) -> Result<(), T729Error> {
+        let file = File::create(path).map_err(|e| T729Error::SerializationError(e.to_string()))?;
+        serde_json::to_writer(file, &self.registry)
+            .map_err(|e| T729Error::SerializationError(e.to_string()))?;
+        info!("Saved registry to {}", path);
+        Ok(())
+    }
+
+    /// Loads the macro registry from a JSON file.
+    pub fn load_registry(&mut self, path: &str) -> Result<(), T729Error> {
+        let mut file = File::open(path).map_err(|e| T729Error::SerializationError(e.to_string()))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|e| T729Error::SerializationError(e.to_string()))?;
+        let registry: HashMap<T729Digit, T729Macro> = serde_json::from_str(&contents)
+            .map_err(|e| T729Error::SerializationError(e.to_string()))?;
+        for (digit, mac) in registry {
+            self.register_macro(digit, mac)?;
+        }
+        info!("Loaded registry from {}", path);
+        Ok(())
+    }
+}
+@#
+
+@* End of libt729.cweb

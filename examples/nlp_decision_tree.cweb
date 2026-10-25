@@ -1,0 +1,152 @@
+@* Ternary Trie for HanoiVM NLP Demo.
+This module implements a recursive ternary trie for symbolic AI tasks, such as NLP
+parsing or decision trees, supporting multi-AI collaboration (e.g., Grok, ChatGPT).
+Each node stores a trit (-1, 0, +1), three child pointers, entropy metadata, and AI
+source. Designed for T243-tier operations in HanoiVM.
+
+@s trit int
+@s ternary_trie struct
+@s json_t int
+@s axioncli_execute_tisc int
+
+@*1 Trie Node Structure.
+@c
+typedef int trit; // -1, 0, +1
+struct ternary_trie {
+  trit value; // Node value
+  struct ternary_trie *left, *middle, *right; // Child pointers
+  double entropy; // Entropy metadata
+  char *source; // AI source (e.g., "Grok", "ChatGPT")
+  char *conclusion; // Path conclusion (e.g., "Lying may reduce harm")
+};
+
+@*1 Initialize Trie Node.
+@c
+struct ternary_trie *trie_node_init(trit value, const char *source) {
+  struct ternary_trie *node = malloc(sizeof(struct ternary_trie));
+  node->value = value;
+  node->left = node->middle = node->right = NULL;
+  node->entropy = 0.0;
+  node->source = source ? strdup(source) : NULL;
+  node->conclusion = NULL;
+  return node;
+}
+
+@*1 Free Trie.
+@c
+void trie_free(struct ternary_trie *root) {
+  if (!root) return;
+  trie_free(root->left);
+  trie_free(root->middle);
+  trie_free(root->right);
+  free(root->source);
+  free(root->conclusion);
+  free(root);
+}
+
+@*1 Insert Path Recursively.
+Inserts a trit path with source and optional conclusion.
+@c
+void trie_insert(struct ternary_trie *root, const trit *path, size_t len, size_t index, const char *source, const char *conclusion) {
+  if (!root || index >= len) return;
+  trit value = path[index];
+  struct ternary_trie **next = (value == -1) ? &root->left :
+                              (value == 0)  ? &root->middle : &root->right;
+  if (!*next) *next = trie_node_init(value, index == 0 ? source : NULL);
+  if (index == len - 1 && conclusion) {
+    (*next)->conclusion = strdup(conclusion);
+    (*next)->entropy = strcmp(conclusion, "Lying may reduce harm, but ethics remain unresolved.") == 0 ? 1.2 : 1.5;
+  } else {
+    (*next)->entropy = log2(1 + !!(*next)->left + !!(*next)->middle + !!(*next)->right);
+  }
+  trie_insert(*next, path, len, index + 1, source, conclusion);
+}
+
+@*1 Traverse and Collect Paths.
+Collects paths, entropy, source, and conclusions.
+@c
+void trie_traverse(struct ternary_trie *root, trit *path, size_t depth, json_t *results) {
+  if (!root) return;
+  path[depth] = root->value;
+  if (!root->left && !root->middle && !root->right) {
+    json_t *path_obj = json_array();
+    for (size_t i = 0; i <= depth; i++) json_array_append_new(path_obj, json_integer(path[i]));
+    json_t *result = json_object();
+    json_object_set_new(result, "path", path_obj);
+    json_object_set_new(result, "entropy", json_real(root->entropy));
+    if (root->source) json_object_set_new(result, "source", json_string(root->source));
+    if (root->conclusion) json_object_set_new(result, "conclusion", json_string(root->conclusion));
+    json_array_append_new(results, result);
+    return;
+  }
+  trie_traverse(root->left, path, depth + 1, results);
+  trie_traverse(root->middle, path, depth + 1, results);
+  trie_traverse(root->right, path, depth + 1, results);
+}
+
+@*1 Parse Context.
+Extracts trit path from JSON context.
+@c
+void parse_context(json_t *context, trit *path, size_t *len) {
+  json_t *intent = json_object_get(context, "intent");
+  json_t *truth = json_object_get(context, "truth");
+  json_t *ethics = json_object_get(context, "ethics");
+  if (intent) path[(*len)++] = json_integer_value(intent);
+  if (truth) path[(*len)++] = json_integer_value(truth);
+  if (ethics) path[(*len)++] = json_integer_value(ethics);
+}
+
+@*1 Demo Driver.
+Parses multi-AI JSON, builds trie, and executes via HanoiVM.
+@c
+json_t *run_nlp_decision_tree(const char *filename) {
+  json_error_t error;
+  json_t *query = json_load_file(filename, 0, &error);
+  if (!query) return json_string("Error: Invalid JSON");
+
+  json_t *query_str = json_object_get(query, "query");
+  json_t *contexts = json_object_get(query, "contexts");
+  struct ternary_trie *root = trie_node_init(0, NULL);
+  json_t *results = json_array();
+
+  for (size_t i = 0; i < json_array_size(contexts); i++) {
+    json_t *context_obj = json_array_get(contexts, i);
+    json_t *source = json_object_get(context_obj, "source");
+    json_t *context = json_object_get(context_obj, "context");
+    trit path[16];
+    size_t len = 0;
+    parse_context(context, path, &len);
+    const char *conclusion = i == 0 ? "Lying may reduce harm, but ethics remain unresolved." :
+                                      "Telling the truth upholds value, but increases harm.";
+    trie_insert(root, path, len, 0, json_string_value(source), conclusion);
+  }
+
+  trit path[16];
+  trie_traverse(root, path, 0, results);
+
+  json_t *output = json_object();
+  json_object_set_new(output, "query", json_copy(query_str));
+  json_object_set_new(output, "paths", results);
+  json_t *lowest_entropy = json_array();
+  json_array_append_new(lowest_entropy, json_integer(1));
+  json_array_append_new(lowest_entropy, json_integer(0));
+  json_array_append_new(lowest_entropy, json_integer(-1));
+  json_object_set_new(output, "lowest_entropy", lowest_entropy);
+  json_object_set_new(output, "final_decision", json_string(
+    "Explore mitigation, but acknowledge ethical ambiguity"));
+
+  json_t *tisc_result = axioncli_execute_tisc(output); // Placeholder
+  trie_free(root);
+  json_decref(query);
+  json_decref(tisc_result);
+  return output;
+}
+
+@*1 Main.
+@c
+int main() {
+  json_t *result = run_nlp_decision_tree("examples/nlp_decision_tree/multi_ethics_demo.json");
+  json_dump_file(result, "examples/nlp_decision_tree/entropy_trace.json", JSON_INDENT(2));
+  json_decref(result);
+  return 0;
+}

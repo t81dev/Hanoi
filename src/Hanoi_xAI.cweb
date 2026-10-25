@@ -1,0 +1,297 @@
+@* HanoiVM xAI Demo.
+
+This module demonstrates HanoiVM's ternary computing for xAI, processing
+research queries with ternary logic, entropy-driven ranking, and 3D
+visualization. It integrates with |tisc_query_compiler.cweb| and
+|ternary_coprocessor.cweb| to showcase symbolic AI enhancements for Grok.
+Upgrades include robust error handling, batch processing, configurable
+candidate limits, visualization export, xAI API integration, and ternary
+co-processor optimization.
+
+@p
+#include "tisc_query_compiler.h"
+#include "t81graph.h"
+#include "t729tensor.h"
+#include "FrameSceneBuilder.h"
+#include "ternary_coprocessor.h"
+#include "xai_api.h" /* Hypothetical xAI API interface */
+#include <GLFW/glfw3.h>
+#include <GL/glew.h>
+#include "stb_image_write.h" /* For PNG export */
+
+@d MAX_CANDIDATES_DEFAULT 8
+
+@q
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+  HanoiVM xAI Demo
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+@>
+
+@*1 Data Structures.
+
+Define the demo context with dynamic candidate arrays and memory pool support.
+
+@<Define DemoContext@> =
+typedef struct {
+    TISCQuery *query;
+    AIResponseCandidate *candidates; /* Dynamic array */
+    float *entropy_scores;
+    int candidate_count;
+    int max_candidates; /* Configurable limit */
+    T81Graph *reasoning_graph;
+    FrameSceneBuilder *visualizer;
+    TernaryCoProcessor *tcp;
+    MemoryPool *pool; /* Optional memory pool */
+} DemoContext;
+
+@<Define QueryResult@> =
+typedef struct {
+    char *query_text;
+    AIResponse *response;
+} QueryResult;
+
+@*1 Initialization.
+
+Initialize the demo context with configurable candidate limit and memory pool.
+
+@<Initialize DemoContext@> =
+DemoContext *init_demo_context(const char *input, int max_candidates) {
+    TernaryCoProcessor *tcp = init_tcp_emulated();
+    if (!tcp) return NULL;
+    MemoryPool *pool = create_memory_pool(); /* Optional */
+    DemoContext *ctx = pool ? pool_alloc(pool, sizeof(DemoContext)) : (DemoContext *)malloc(sizeof(DemoContext));
+    if (!ctx) { free_tcp(tcp); if (pool) destroy_memory_pool(pool); return NULL; }
+    ctx->candidates = (AIResponseCandidate *)malloc(sizeof(AIResponseCandidate) * max_candidates);
+    ctx->entropy_scores = (float *)malloc(sizeof(float) * max_candidates);
+    if (!ctx->candidates || !ctx->entropy_scores) {
+        free(ctx->candidates); free(ctx->entropy_scores); free_tcp(tcp);
+        if (pool) destroy_memory_pool(pool); free(ctx); return NULL;
+    }
+    ctx->query = init_tisc_query(input);
+    if (!ctx->query) { free(ctx->candidates); free(ctx->entropy_scores); free_tcp(tcp); if (pool) destroy_memory_pool(pool); free(ctx); return NULL; }
+    ctx->candidate_count = 0;
+    ctx->max_candidates = max_candidates;
+    ctx->reasoning_graph = tcp_create_graph(tcp);
+    if (!ctx->reasoning_graph) { free_tisc_query(ctx->query); free(ctx->candidates); free(ctx->entropy_scores); free_tcp(tcp); if (pool) destroy_memory_pool(pool); free(ctx); return NULL; }
+    ctx->visualizer = init_frame_scene_builder();
+    if (!ctx->visualizer) { tcp_free_graph(tcp, ctx->reasoning_graph); free_tisc_query(ctx->query); free(ctx->candidates); free(ctx->entropy_scores); free_tcp(tcp); if (pool) destroy_memory_pool(pool); free(ctx); return NULL; }
+    ctx->tcp = tcp;
+    ctx->pool = pool;
+    return ctx;
+}
+
+@*1 Process Query.
+
+Compile and execute the query, generating candidates with validation.
+
+@<Process demo query@> =
+void process_demo_query(DemoContext *ctx) {
+    compile_to_tisc(ctx->query, ctx->tcp);
+    T81SearchResult *results = tcp_execute_query(ctx->tcp, ctx->query);
+    if (!results) return;
+    ctx->candidate_count = MIN(results->count, ctx->max_candidates);
+    for (int i = 0; i < ctx->candidate_count; ++i) {
+        if (results->items[i].text) {
+            ctx->candidates[i] = results->items[i]; /* Shallow copy */
+            ctx->entropy_scores[i] = tcp_evaluate_entropy(ctx->tcp, &ctx->candidates[i]);
+            tcp_update_graph(ctx->tcp, ctx->reasoning_graph, &ctx->candidates[i]);
+        } else {
+            ctx->candidate_count = i; /* Stop if text is invalid */
+            break;
+        }
+    }
+    free_search_results(results);
+}
+
+@*1 Select Response.
+
+Select the highest-entropy response with validation.
+
+@<Select demo response@> =
+AIResponse *select_demo_response(DemoContext *ctx) {
+    if (ctx->candidate_count == 0) return NULL;
+    int best_idx = 0;
+    float max_entropy = ctx->entropy_scores[0];
+    for (int i = 1; i < ctx->candidate_count; ++i) {
+        if (ctx->entropy_scores[i] > max_entropy) {
+            max_entropy = ctx->entropy_scores[i];
+            best_idx = i;
+        }
+    }
+    if (!ctx->candidates[best_idx].text) return NULL;
+    AIResponse *response = (AIResponse *)malloc(sizeof(AIResponse));
+    if (!response) return NULL;
+    response->text = strdup(ctx->candidates[best_idx].text);
+    if (!response->text) { free(response); return NULL; }
+    response->entropy = max_entropy;
+    return response;
+}
+
+@*1 Visualize Reasoning.
+
+Render the reasoning graph in 3D and export to PNG.
+
+@<Visualize demo reasoning@> =
+void visualize_demo_reasoning(DemoContext *ctx) {
+    fsb_render_graph(ctx->visualizer, ctx->reasoning_graph, ctx->query->entropy_score);
+    fsb_export_graph(ctx->visualizer, ctx->reasoning_graph, "reasoning_graph.png");
+}
+
+@<Export visualization@> =
+void fsb_export_graph(FrameSceneBuilder *fsb, T81Graph *graph, const char *filename) {
+    glBindFramebuffer(GL_FRAMEBUFFER, fsb->framebuffer);
+    fsb_render_graph(fsb, graph, 0.0f); /* Use dummy entropy for export */
+    int width = 800, height = 600;
+    unsigned char *pixels = (unsigned char *)malloc(width * height * 3);
+    if (pixels) {
+        glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels);
+        stbi_write_png(filename, width, height, 3, pixels, width * 3);
+        free(pixels);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+@*1 Ternary Co-Processor.
+
+Optimize query execution with caching.
+
+@<Ternary co-processor cache@> =
+typedef struct {
+    char *query_text;
+    T81SearchResult *result;
+} QueryCache;
+
+T81SearchResult *tcp_execute_query(TernaryCoProcessor *tcp, TISCQuery *query) {
+    static QueryCache cache[100]; /* Simple static cache */
+    static int cache_size = 0;
+    for (int i = 0; i < cache_size; ++i) {
+        if (strcmp(cache[i].query_text, query->text) == 0) {
+            return cache[i].result; /* Cache hit */
+        }
+    }
+    T81SearchResult *result = tcp_execute_query_internal(tcp, query); /* Hypothetical internal function */
+    if (cache_size < 100 && result) {
+        cache[cache_size].query_text = strdup(query->text);
+        cache[cache_size].result = result; /* Shallow copy */
+        cache_size++;
+    }
+    return result;
+}
+
+@*1 Batch Processing.
+
+Support multiple queries for batch processing.
+
+@<Run xAI demo batch@> =
+QueryResult *run_xai_demo_batch(const char **queries, int query_count, int max_candidates) {
+    QueryResult *results = (QueryResult *)malloc(sizeof(QueryResult) * query_count);
+    if (!results) return NULL;
+    for (int i = 0; i < query_count; ++i) {
+        results[i].query_text = strdup(queries[i]);
+        results[i].response = run_xai_demo(queries[i], max_candidates);
+    }
+    return results;
+}
+
+void free_query_results(QueryResult *results, int query_count) {
+    for (int i = 0; i < query_count; ++i) {
+        free(results[i].query_text);
+        if (results[i].response) {
+            free(results[i].response->text);
+            free(results[i].response);
+        }
+    }
+    free(results);
+}
+
+@*1 Main Demo.
+
+Run the demo for a query, integrating with xAI API if available.
+
+@<Run xAI demo@> =
+AIResponse *run_xai_demo(const char *query, int max_candidates) {
+    if (xai_api_available()) {
+        XAIResponse *xai_response = xai_api_query(query);
+        if (xai_response) {
+            AIResponse *response = (AIResponse *)malloc(sizeof(AIResponse));
+            if (!response) { xai_api_free_response(xai_response); return NULL; }
+            response->text = strdup(xai_response->text);
+            response->entropy = xai_response->confidence; /* Map confidence to entropy */
+            xai_api_free_response(xai_response);
+            if (!response->text) { free(response); return NULL; }
+            return response;
+        }
+    }
+    DemoContext *ctx = init_demo_context(query, max_candidates);
+    if (!ctx) return NULL;
+    process_demo_query(ctx);
+    AIResponse *response = select_demo_response(ctx);
+    visualize_demo_reasoning(ctx);
+    free_demo_context(ctx);
+    return response;
+}
+
+@*1 Cleanup.
+
+Free demo resources.
+
+@<Free DemoContext@> =
+void free_demo_context(DemoContext *ctx) {
+    if (ctx) {
+        free_tisc_query(ctx->query);
+        tcp_free_graph(ctx->tcp, ctx->reasoning_graph);
+        free_frame_scene_builder(ctx->visualizer);
+        free(ctx->candidates);
+        free(ctx->entropy_scores);
+        free_tcp(ctx->tcp);
+        if (ctx->pool) destroy_memory_pool(ctx->pool);
+        free(ctx);
+    }
+}
+
+@*1 FrameSceneBuilder Initialization.
+
+Initialize OpenGL-based visualizer.
+
+@<Initialize FrameSceneBuilder@> =
+FrameSceneBuilder *init_frame_scene_builder() {
+    if (!glfwInit()) return NULL;
+    FrameSceneBuilder *fsb = (FrameSceneBuilder *)malloc(sizeof(FrameSceneBuilder));
+    if (!fsb) { glfwTerminate(); return NULL; }
+    fsb->window = glfwCreateWindow(800, 600, "HanoiVM Reasoning Graph", NULL, NULL);
+    if (!fsb->window) { free(fsb); glfwTerminate(); return NULL; }
+    glfwMakeContextCurrent(fsb->window);
+    if (glewInit() != GLEW_OK) { glfwDestroyWindow(fsb->window); free(fsb); glfwTerminate(); return NULL; }
+    fsb->framebuffer = 0; /* Initialize framebuffer for export */
+    return fsb;
+}
+
+void free_frame_scene_builder(FrameSceneBuilder *fsb) {
+    if (fsb) {
+        glfwDestroyWindow(fsb->window);
+        free(fsb);
+        glfwTerminate();
+    }
+}
+
+@*1 Ternary Co-Processor Initialization.
+
+Support hardware fallback.
+
+@<Initialize TernaryCoProcessor@> =
+TernaryCoProcessor *init_tcp_emulated() {
+    if (tcp_hardware_available()) {
+        return init_tcp_hardware(); /* Hypothetical hardware initialization */
+    }
+    TernaryCoProcessor *tcp = (TernaryCoProcessor *)malloc(sizeof(TernaryCoProcessor));
+    if (!tcp) return NULL;
+    /* Initialize emulated ternary co-processor */
+    return tcp;
+}
+
+@*1 TODO:
+- Implement real-time co-processor simulation (partially addressed with caching).
+- Optimize memory pool integration for production use.
+- Add support for video export in visualization.
+- Expand xAI API error handling for quota limits and network issues.
+@>

@@ -1,0 +1,90 @@
+@* tier_scheduler.cweb | Tier Promotion/Control Daemon for HanoiVM *@
+
+This module evaluates the current VM context and recommends tier transitions
+between T81 → T243 → T729. It integrates with entropy, recursion, and symbolic
+intent logic, enabling adaptive symbolic execution.
+
+Accessible via `/sys/kernel/debug/tier-control` for real-time introspection.
+
+@c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/debugfs.h>
+#include <linux/uaccess.h>
+#include <linux/slab.h>
+#include "hanoivm_vm.h"
+#include "entropy_monitor.h"
+#include "recursion_exporter.h"
+#include "axion_api.h"
+
+#define TIER_NODE_NAME "tier-control"
+static struct dentry *tier_debug_node;
+
+@<Internal State@>=
+static char tier_status[256];
+
+static const char* tier_name(int mode) {
+    switch (mode) {
+        case 81: return "T81";
+        case 243: return "T243";
+        case 729: return "T729";
+        default: return "UNKNOWN";
+    }
+}
+
+@<Tier Evaluation Logic@>=
+int recommend_tier(HVMContext* ctx) {
+    int entropy = get_entropy_flux();
+    int depth = get_recursion_depth();
+    const char* intent = get_symbolic_intent(ctx);
+
+    if (entropy > 100 || depth > 100 || strstr(intent, "AI")) return 729;
+    if (entropy > 40 || depth > 40) return 243;
+    return 81;
+}
+
+@<Trace Tier Recommendation@>=
+void evaluate_tier(HVMContext* ctx) {
+    int suggested = recommend_tier(ctx);
+    snprintf(tier_status, sizeof(tier_status),
+             "[Tier Scheduler] Recommended: %s | Depth=%d Entropy=%d Intent=%s\n",
+             tier_name(suggested),
+             get_recursion_depth(),
+             get_entropy_flux(),
+             get_symbolic_intent(ctx));
+    ctx->tier_mode = suggested;
+}
+
+@<DebugFS Interface@>=
+static ssize_t tier_read(struct file *file, char __user *ubuf,
+                         size_t count, loff_t *ppos) {
+    if (*ppos > 0) return 0;
+    size_t len = strlen(tier_status);
+    if (copy_to_user(ubuf, tier_status, len)) return -EFAULT;
+    *ppos = len;
+    return len;
+}
+
+static const struct file_operations tier_fops = {
+    .owner = THIS_MODULE,
+    .read = tier_read
+};
+
+@<Module Init/Exit@>=
+static int __init tier_init(void) {
+    pr_info("[tier-control] Tier scheduler active\n");
+    tier_debug_node = debugfs_create_file(TIER_NODE_NAME, 0444, NULL, NULL, &tier_fops);
+    return tier_debug_node ? 0 : -ENOMEM;
+}
+
+static void __exit tier_exit(void) {
+    debugfs_remove(tier_debug_node);
+    pr_info("[tier-control] Exited\n");
+}
+
+module_init(tier_init);
+module_exit(tier_exit);
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("Axion + HanoiVM Team");
+MODULE_DESCRIPTION("Tier promotion controller for HanoiVM");

@@ -1,0 +1,104 @@
+@* t81sha3_81.cweb | SHA3-81 Hash Implementation Using T81 Data Types.
+
+This document defines a SHA3-style ternary hash function based on the T81 Data Type System.
+We use a 5x5 matrix of `T81BigInt` lanes to simulate a base-81 analog of the Keccak state.
+Only the `θ` step is currently implemented, with stubs for absorb/squeeze and rotation.
+
+@c
+#include <stdio.h>
+#include <stdlib.h>
+#include "t81.h" // Assumed interface for T81 data types
+
+#define STATE_SIZE 5
+
+typedef struct {
+    T81BigIntHandle lanes[STATE_SIZE][STATE_SIZE];
+} T81SHA3State;
+
+@<Helper Functions@>
+@<SHA3-81 Round Functions@>
+@<SHA3-81 Hash Driver@>
+@<SHA3-81 Main Test@>
+
+@<Helper Functions@>=
+TritError t81bigint_rotate(T81BigIntHandle in, int digits, T81BigIntHandle* out) {
+    // Placeholder: rotate base-81 digits to the left by `digits` positions
+    // This function assumes that digits are stored little-endian
+    // Implementation is left for future development
+    return TRIT_OK;
+}
+
+@<SHA3-81 Round Functions@>=
+void t81sha3_theta(T81SHA3State *state) {
+    T81BigIntHandle C[STATE_SIZE], D[STATE_SIZE];
+    for (int x = 0; x < STATE_SIZE; x++) {
+        C[x] = t81bigint_new(0);
+        for (int y = 0; y < STATE_SIZE; y++) {
+            T81BigIntHandle tmp;
+            t81bigint_add(C[x], state->lanes[x][y], &tmp);
+            t81bigint_free(C[x]);
+            C[x] = tmp;
+        }
+    }
+    for (int x = 0; x < STATE_SIZE; x++) {
+        int x1 = (x + 1) % STATE_SIZE;
+        int x4 = (x + 4) % STATE_SIZE;
+        T81BigIntHandle rot;
+        t81bigint_rotate(C[x1], 1, &rot);
+        t81bigint_add(C[x4], rot, &D[x]);
+        t81bigint_free(rot);
+    }
+    for (int x = 0; x < STATE_SIZE; x++) {
+        for (int y = 0; y < STATE_SIZE; y++) {
+            T81BigIntHandle tmp;
+            t81bigint_add(state->lanes[x][y], D[x], &tmp);
+            t81bigint_free(state->lanes[x][y]);
+            state->lanes[x][y] = tmp;
+        }
+    }
+    for (int x = 0; x < STATE_SIZE; x++) {
+        t81bigint_free(C[x]);
+        t81bigint_free(D[x]);
+    }
+}
+
+@<SHA3-81 Hash Driver@>=
+void t81sha3_init(T81SHA3State *state) {
+    for (int x = 0; x < STATE_SIZE; x++)
+        for (int y = 0; y < STATE_SIZE; y++)
+            state->lanes[x][y] = t81bigint_new(0);
+}
+
+void t81sha3_absorb(T81SHA3State *state, const char *input) {
+    // Stub: convert input to T81BigInt and XOR with state
+    // Requires implementation of base-81 padding and ternary representation
+}
+
+void t81sha3_squeeze(T81SHA3State *state, T81BigIntHandle *hash_out) {
+    // Combine first few lanes to produce hash output
+    *hash_out = t81bigint_new(0);
+    for (int i = 0; i < 3; i++) {
+        T81BigIntHandle tmp;
+        t81bigint_add(*hash_out, state->lanes[i][0], &tmp);
+        t81bigint_free(*hash_out);
+        *hash_out = tmp;
+    }
+}
+
+@<SHA3-81 Main Test@>=
+int main() {
+    T81SHA3State state;
+    t81sha3_init(&state);
+    t81sha3_absorb(&state, "test input");
+
+    T81BigIntHandle result;
+    t81sha3_squeeze(&state, &result);
+
+    char *hash_str;
+    t81bigint_to_string(result, &hash_str);
+    printf("SHA3-81 Result: %s\n", hash_str);
+    free(hash_str);
+    t81bigint_free(result);
+
+    return 0;
+}

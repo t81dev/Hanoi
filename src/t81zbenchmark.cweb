@@ -1,0 +1,116 @@
+@* T81Z Compression Benchmark.
+This module benchmarks T81Z ternary compression against zlib, LZ4, and Brotli
+on AI datasets (e.g., tokenized text, neural weights). Outputs results as CSV
+and Markdown.
+
+@s t81z_compress int
+@s benchmark_result struct
+@s clock_gettime int
+
+@*1 Dependencies.
+@c
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include "t81z.h"
+#include <zlib.h>
+#include <lz4.h>
+#include <brotli/enc.h>
+
+@*1 Benchmark Result Structure.
+Stores compression ratio and time.
+@c
+struct benchmark_result {
+  double ratio; // Compressed size / original size
+  double time_ms; // Compression time in milliseconds
+};
+
+@*1 Load Dataset.
+Reads a file into a buffer.
+@c
+char *load_dataset(const char *filename, size_t *size) {
+  FILE *f = fopen(filename, "rb");
+  if (!f) return NULL;
+  fseek(f, 0, SEEK_END);
+  *size = ftell(f);
+  rewind(f);
+  char *buffer = malloc(*size);
+  fread(buffer, 1, *size, f);
+  fclose(f);
+  return buffer;
+}
+
+@*1 T81Z Benchmark.
+Runs T81Z compression and measures performance.
+@c
+struct benchmark_result t81z_benchmark(const char *input_file) {
+  size_t input_size;
+  char *input = load_dataset(input_file, &input_size);
+  if (!input) return (struct benchmark_result){0, 0};
+
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  size_t output_size;
+  char *output = t81z_compress(input, input_size, &output_size);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+
+  double time_ms = (end.tv_sec - start.tv_sec) * 1000.0 +
+                   (end.tv_nsec - start.tv_nsec) / 1e6;
+  double ratio = (double)output_size / input_size;
+  free(input);
+  free(output);
+  return (struct benchmark_result){ratio, time_ms};
+}
+
+@*1 Zlib Benchmark.
+@c
+struct benchmark_result zlib_benchmark(const char *input_file) {
+  size_t input_size;
+  char *input = load_dataset(input_file, &input_size);
+  if (!input) return (struct benchmark_result){0, 0};
+
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  uLongf output_size = compressBound(input_size);
+  char *output = malloc(output_size);
+  compress((Bytef *)output, &output_size, (Bytef *)input, input_size);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+
+  double time_ms = (end.tv_sec - start.tv_sec) * 1000.0 +
+                   (end.tv_nsec - start.tv_nsec) / 1e6;
+  double ratio = (double)output_size / input_size;
+  free(input);
+  free(output);
+  return (struct benchmark_result){ratio, time_ms};
+}
+
+@*1 Main Benchmark Runner.
+Compares T81Z, zlib, LZ4, Brotli and outputs to CSV.
+@c
+int main(int argc, char *argv[]) {
+  if (argc != 2) {
+    fprintf(stderr, "Usage: %s <input_file>\n", argv[0]);
+    return 1;
+  }
+  FILE *csv = fopen("benchmarks/t81z_benchmarks.csv", "w");
+  fprintf(csv, "Algorithm,Ratio,Time_ms\n");
+
+  struct benchmark_result t81z = t81z_benchmark(argv[1]);
+  fprintf(csv, "T81Z,%.3f,%.3f\n", t81z.ratio, t81z.time_ms);
+
+  struct benchmark_result zlib = zlib_benchmark(argv[1]);
+  fprintf(csv, "zlib,%.3f,%.3f\n", zlib.ratio, zlib.time_ms);
+
+  // TODO: Add LZ4, Brotli benchmarks
+  fclose(csv);
+
+  // Generate Markdown summary
+  FILE *md = fopen("benchmarks/benchmark_summary.md", "w");
+  fprintf(md, "# T81Z Benchmark Results\n\n");
+  fprintf(md, "| Algorithm | Ratio | Time (ms) |\n");
+  fprintf(md, "|-----------|-------|-----------|\n");
+  fprintf(md, "| T81Z      | %.3f | %.3f     |\n", t81z.ratio, t81z.time_ms);
+  fprintf(md, "| zlib      | %.3f | %.3f     |\n", zlib.ratio, zlib.time_ms);
+  fclose(md);
+  return 0;
+}

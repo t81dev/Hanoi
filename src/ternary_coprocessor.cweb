@@ -1,0 +1,587 @@
+@* ternary_coprocessor.cweb | HanoiVM Ternary Coprocessor
+@ This file defines the architecture and software interface for the HanoiVM ternary
+@ coprocessor, a specialized hardware unit for executing T81, T243, and T729 ternary
+@ logic operations. The coprocessor accelerates symbolic computation, AI-driven tasks,
+@ and entropy-aware execution, integrating with axion-ai.cweb, config.cweb,
+@ ternary_arithmetic_optimization.cweb, and the LLVM backend (T81RegisterInfo.td,
+@ T81InstrInfo.td). It supports T81Lang programs, includes a simulation mode, and
+@ provides visualization via DebugFS for Looking Glass. The coprocessor executes
+@ instructions like TADD, TMUL, TNEG, TMARKOV, and TSYM, aligning with
+@ roadmap Phases 6–9.
+@c
+
+// Standard Linux kernel headers for module development
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/device.h>
+#include <linux/cdev.h>
+#include <linux/pci.h> // For PCIe integration
+#include <linux/random.h> // For entropy simulation
+#include <linux/debugfs.h> // For DebugFS interface
+// HanoiVM-specific headers
+#include "axion-ai.h" // For t81_unit_t, t81_ternary_t, default_gen_entropy, axion_log
+#include "hanoivm_config.h" // For enable_ternary_coprocessor, TERNARY_LOGIC_MODE
+// Module metadata constants
+#define COPROCESSOR_NAME "hanoivm_coprocessor"
+#define DEVICE_NAME "ternary_coprocessor"
+#define CLASS_NAME "ternary_coprocessor"
+#define REG_COUNT 81 // Matches T81RegisterInfo.td (R0-R80)
+#define MAX_INSTR_QUEUE 256 // Instruction queue size
+// Function and type declarations
+@<Coprocessor Types@>
+@<Coprocessor Functions@>
+@<Global Variables@>
+@<Coprocessor Initialization@>
+@<Coprocessor Instruction Execution@>
+@<Coprocessor Queue Management@>
+@<Coprocessor IOCTL Interface@>
+@<Coprocessor Visualization@>
+@<Coprocessor DebugFS Interface@>
+@<Coprocessor Hardware Interface@>
+@<Coprocessor Simulation@>
+@<Coprocessor Module Lifecycle@>
+@<Ternary Coprocessor Tutorial@>
+@<Coprocessor Types@>=
+// Ternary instruction opcodes, aligned with T81InstrInfo.td
+typedef enum {
+    TADD = 0x01,   // Ternary addition (mod 3)
+    TSUB = 0x02,   // Ternary subtraction (mod 3)
+    TMUL = 0x03,   // Ternary multiplication (mod 3)
+    TNEG = 0x04,   // Ternary negation (1 -> -1, -1 -> 1, 0 -> 0)
+    TENT = 0x05,   // Entropy computation
+    TSEL = 0x06,   // Ternary select
+    TMARKOV = 0x07,// Markov chain transition
+    TSYM = 0x08    // Symbolic evaluation
+} t81_coprocessor_opcode_t;
+// Coprocessor register, storing value and entropy
+typedef struct {
+    t81_ternary_t value; // TERN_LOW (-1), TERN_MID (0), TERN_HIGH (1)
+    unsigned char entropy; // Entropy metadata (0-255)
+} t81_coprocessor_reg_t;
+// Coprocessor instruction, mapping to T81InstrInfo.td
+typedef struct {
+    t81_coprocessor_opcode_t opcode; // Instruction opcode
+    int dst_reg;  // Destination register (0-80)
+    int src1_reg; // Source register 1
+    int src2_reg; // Source register 2 (or immediate for TENT, TSYM)
+} t81_coprocessor_instr_t;
+// Coprocessor state, managing registers and instruction queue
+typedef struct {
+    t81_coprocessor_reg_t registers[REG_COUNT]; // R0-R80
+    t81_coprocessor_instr_t instr_queue[MAX_INSTR_QUEUE];
+    int queue_head; // Head of instruction queue
+    int queue_tail; // Tail of instruction queue
+    unsigned int cycle_count; // Execution cycles
+    bool active; // Coprocessor enabled
+    bool simulate; // Simulation mode (no hardware)
+    struct mutex lock; // Synchronization
+    struct device *dev; // PCIe device
+} t81_coprocessor_t;
+@<Global Variables@>=
+// Global coprocessor state
+static t81_coprocessor_t coprocessor;
+// Character device metadata
+static dev_t coprocessor_dev;
+static struct cdev coprocessor_cdev;
+static struct class *coprocessor_class;
+static struct device *coprocessor_device;
+// DebugFS file
+static struct dentry *debugfs_file;
+@<Coprocessor Initialization@>=
+// Initialize coprocessor state
+static int coprocessor_init_state(void) {
+    // Initialize mutex for thread safety
+    mutex_init(&coprocessor.lock);
+    // Reset queue pointers
+    coprocessor.queue_head = 0;
+    coprocessor.queue_tail = 0;
+    // Reset cycle count
+    coprocessor.cycle_count = 0;
+    // Set active state based on config
+    coprocessor.active = hvm_config.enable_ternary_coprocessor;
+    // Enable simulation mode if no hardware
+    coprocessor.simulate = !coprocessor.active || !coprocessor.dev;
+    // Clear registers and queue
+    memset(coprocessor.registers, 0, sizeof(coprocessor.registers));
+    memset(coprocessor.instr_queue, 0, sizeof(coprocessor.instr_queue));
+    pr_info("%s: Coprocessor initialized, active=%d, simulate=%d\n",
+            COPROCESSOR_NAME, coprocessor.active, coprocessor.simulate);
+    return 0;
+}
+@<Coprocessor Instruction Execution@>=
+// Execute a single instruction, updating registers and entropy
+static int execute_instruction(t81_coprocessor_instr_t *instr) {
+    // Validate register indices
+    if (instr->dst_reg >= REG_COUNT || instr->src1_reg >= REG_COUNT ||
+        instr->src2_reg >= REG_COUNT) {
+        pr_err("%s: Invalid register index\n", COPROCESSOR_NAME);
+        return -EINVAL;
+    }
+    // Access registers
+    t81_coprocessor_reg_t *dst = &coprocessor.registers[instr->dst_reg];
+    t81_coprocessor_reg_t *src1 = &coprocessor.registers[instr->src1_reg];
+    t81_coprocessor_reg_t *src2 = &coprocessor.registers[instr->src2_reg];
+    int ret = 0;
+
+mutex_lock(&coprocessor.lock);
+switch (instr->opcode) {
+case TADD:
+    // Modulo-3 addition, maps to ternary_arithmetic_optimization.cweb
+    dst->value = (src1->value + src2->value) % 3;
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TSUB:
+    // Modulo-3 subtraction
+    dst->value = (src1->value - src2->value + 3) % 3;
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TMUL:
+    // Modulo-3 multiplication, maps to ternary_arithmetic_optimization.cweb
+    dst->value = (src1->value * src2->value) % 3;
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TNEG:
+    // Ternary negation, maps to ternary_arithmetic_optimization.cweb
+    dst->value = (src1->value == 1) ? -1 : (src1->value == -1) ? 1 : 0;
+    dst->entropy = default_gen_entropy(src1->entropy, 0);
+    break;
+case TENT:
+    // Entropy computation, updates entropy metadata
+    dst->value = src1->value;
+    dst->entropy = default_gen_entropy(src1->entropy, 0);
+    break;
+case TSEL:
+    // Ternary select: if src1 != TERN_LOW, pick src2, else src2+1
+    dst->value = src1->value != TERN_LOW ? src2->value : coprocessor.registers[instr->src2_reg + 1].value;
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TMARKOV:
+    // Markov transition: simulate matrix multiplication (T729 mode)
+    dst->value = (src1->value + src2->value) % 3; // Placeholder
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TSYM:
+    // Symbolic evaluation: map symbol to value (T729 mode)
+    dst->value = src1->value; // Placeholder
+    dst->entropy = default_gen_entropy(src1->entropy, 0);
+    break;
+default:
+    pr_err("%s: Unknown opcode %d\n", COPROCESSOR_NAME, instr->opcode);
+    ret = -EINVAL;
+    goto out;
+}
+// Increment cycle count
+coprocessor.cycle_count++;
+// Log entropy to Axion
+ret = log_entropy((t81_unit_t *)dst);
+
+out:
+    mutex_unlock(&coprocessor.lock);
+    return ret;
+}
+@<Coprocessor Queue Management@>=
+// Queue an instruction for execution
+static int queue_instruction(t81_coprocessor_instr_t instr) {
+    int next_tail;
+
+mutex_lock(&coprocessor.lock);
+// Check for queue overflow
+next_tail = (coprocessor.queue_tail + 1) % MAX_INSTR_QUEUE;
+if (next_tail == coprocessor.queue_head) {
+    mutex_unlock(&coprocessor.lock);
+    pr_err("%s: Instruction queue full\n", COPROCESSOR_NAME);
+    return -ENOMEM;
+}
+// Add instruction to queue
+coprocessor.instr_queue[coprocessor.queue_tail] = instr;
+coprocessor.queue_tail = next_tail;
+mutex_unlock(&coprocessor.lock);
+return 0;
+
+}
+// Execute all queued instructions
+static int execute_queued_instructions(void) {
+    int ret = 0;
+    mutex_lock(&coprocessor.lock);
+    // Process queue until empty
+    while (coprocessor.queue_head != coprocessor.queue_tail) {
+        ret = execute_instruction(&coprocessor.instr_queue[coprocessor.queue_head]);
+        if (ret)
+            break;
+        coprocessor.queue_head = (coprocessor.queue_head + 1) % MAX_INSTR_QUEUE;
+    }
+    mutex_unlock(&coprocessor.lock);
+    return ret;
+}
+@<Coprocessor IOCTL Interface@>=
+// IOCTL commands for user-space interaction
+#define TERNARY_IOC_MAGIC 't'
+#define TERNARY_IOC_EXEC _IO(TERNARY_IOC_MAGIC, 1) // Execute queue
+#define TERNARY_IOC_QUEUE _IOW(TERNARY_IOC_MAGIC, 2, t81_coprocessor_instr_t) // Queue instruction
+#define TERNARY_IOC_READ_REG _IOR(TERNARY_IOC_MAGIC, 3, t81_coprocessor_reg_t) // Read register
+// IOCTL handler
+static long coprocessor_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    t81_coprocessor_instr_t instr;
+    t81_coprocessor_reg_t reg;
+    int ret = 0;
+
+// Require admin privileges
+if (!capable(CAP_SYS_ADMIN)) {
+    pr_err("%s: IOCTL requires CAP_SYS_ADMIN\n", COPROCESSOR_NAME);
+    return -EPERM;
+}
+
+switch (cmd) {
+case TERNARY_IOC_EXEC:
+    // Execute queued instructions
+    ret = execute_queued_instructions();
+    break;
+case TERNARY_IOC_QUEUE:
+    // Copy instruction from user space
+    if (copy_from_user(&instr, (void __user *)arg, sizeof(instr))) {
+        pr_err("%s: Failed to copy instruction\n", COPROCESSOR_NAME);
+        ret = -EFAULT;
+        break;
+    }
+    // Validate register indices
+    if (instr.dst_reg >= REG_COUNT || instr.src1_reg >= REG_COUNT ||
+        instr.src2_reg >= REG_COUNT) {
+        pr_err("%s: Invalid register index\n", COPROCESSOR_NAME);
+        ret = -EINVAL;
+        break;
+    }
+    ret = queue_instruction(instr);
+    break;
+case TERNARY_IOC_READ_REG:
+    // Copy register index from user space
+    if (copy_from_user(&reg, (void __user *)arg, sizeof(reg))) {
+        ret = -EFAULT;
+        break;
+    }
+    // Validate index
+    if (reg.value >= REG_COUNT) {
+        ret = -EINVAL;
+        break;
+    }
+    mutex_lock(&coprocessor.lock);
+    reg = coprocessor.registers[reg.value];
+    mutex_unlock(&coprocessor.lock);
+    // Copy register back to user space
+    if (copy_to_user((void __user *)arg, &reg, sizeof(reg)))
+        ret = -EFAULT;
+    break;
+default:
+    pr_err("%s: Unknown IOCTL command %u\n", COPROCESSOR_NAME, cmd);
+    ret = -EINVAL;
+}
+return ret;
+
+}
+// File operations for character device
+static const struct file_operations coprocessor_fops = {
+    .owner = THIS_MODULE,
+    .unlocked_ioctl = coprocessor_ioctl,
+    .open = axion_open, // Reuse from axion-ai.cweb
+    .release = axion_release,
+};
+@<Coprocessor Visualization@>=
+// Generate JSON for Looking Glass, including register state and instruction trace
+static int coprocessor_visualize_state(char *buf, size_t buf_size) {
+    int pos = 0, i;
+    mutex_lock(&coprocessor.lock);
+    // Output cycle count and registers
+    pos += snprintf(buf + pos, buf_size - pos, "{"cycle_count":%u,"registers":[",
+                    coprocessor.cycle_count);
+    for (i = 0; i < REG_COUNT && pos < buf_size - 20; i++) {
+        pos += snprintf(buf + pos, buf_size - pos, "{"R%d":{"value":%d,"entropy":%u}}%s",
+                        i, coprocessor.registers[i].value, coprocessor.registers[i].entropy,
+                        i < REG_COUNT - 1 ? "," : "");
+    }
+    // Output queue size and last instruction
+    pos += snprintf(buf + pos, buf_size - pos, "],"queue_size":%d,"last_instruction":"",
+                    (coprocessor.queue_tail - coprocessor.queue_head + MAX_INSTR_QUEUE) % MAX_INSTR_QUEUE);
+    if (coprocessor.queue_head != coprocessor.queue_tail) {
+        t81_coprocessor_instr_t *last = &coprocessor.instr_queue[coprocessor.queue_head];
+        switch (last->opcode) {
+        case TADD: pos += snprintf(buf + pos, buf_size - pos, "tadd R%d, R%d, R%d", last->dst_reg, last->src1_reg, last->src2_reg); break;
+        case TMUL: pos += snprintf(buf + pos, buf_size - pos, "tmul R%d, R%d, R%d", last->dst_reg, last->src1_reg, last->src2_reg); break;
+        case TNEG: pos += snprintf(buf + pos, buf_size - pos, "tneg R%d, R%d", last->dst_reg, last->src1_reg); break;
+        default: pos += snprintf(buf + pos, buf_size - pos, "unknown"); break;
+        }
+    }
+    pos += snprintf(buf + pos, buf_size - pos, ""}");
+    mutex_unlock(&coprocessor.lock);
+    return pos;
+}
+@<Coprocessor DebugFS Interface@>=
+// Read coprocessor state via DebugFS
+static ssize_t coprocessor_debugfs_read(struct file *file, char __user *ubuf,
+                                       size_t count, loff_t *ppos) {
+    char *buf;
+    int len;
+
+if (*ppos > 0)
+    return 0;
+
+buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+if (!buf)
+    return -ENOMEM;
+
+len = coprocessor_visualize_state(buf, PAGE_SIZE);
+if (len > count)
+    len = count;
+if (copy_to_user(ubuf, buf, len)) {
+    kfree(buf);
+    return -EFAULT;
+}
+
+kfree(buf);
+*ppos = len;
+return len;
+
+}
+// Write instructions via DebugFS (e.g., "tadd 0 1 2")
+static ssize_t coprocessor_debugfs_write(struct file *file, const char __user *ubuf,
+                                        size_t count, loff_t *ppos) {
+    char *buf;
+    t81_coprocessor_instr_t instr;
+    int ret;
+
+if (count > 128)
+    return -EINVAL;
+if (!capable(CAP_SYS_ADMIN))
+    return -EPERM;
+
+buf = kmalloc(count + 1, GFP_KERNEL);
+if (!buf)
+    return -ENOMEM;
+
+if (copy_from_user(buf, ubuf, count)) {
+    kfree(buf);
+    return -EFAULT;
+}
+buf[count] = '\0';
+
+// Parse commands
+if (sscanf(buf, "tadd %d %d %d", &instr.dst_reg, &instr.src1_reg, &instr.src2_reg) == 3) {
+    instr.opcode = TADD;
+    ret = queue_instruction(instr);
+} else if (sscanf(buf, "tmul %d %d %d", &instr.dst_reg, &instr.src1_reg, &instr.src2_reg) == 3) {
+    instr.opcode = TMUL;
+    ret = queue_instruction(instr);
+} else if (sscanf(buf, "tneg %d %d", &instr.dst_reg, &instr.src1_reg) == 2) {
+    instr.opcode = TNEG;
+    instr.src2_reg = 0;
+    ret = queue_instruction(instr);
+} else if (sscanf(buf, "tent %d %d", &instr.dst_reg, &instr.src1_reg) == 2) {
+    instr.opcode = TENT;
+    instr.src2_reg = 0;
+    ret = queue_instruction(instr);
+} else {
+    ret = -EINVAL;
+}
+
+kfree(buf);
+return ret < 0 ? ret : count;
+
+}
+// DebugFS file operations
+static const struct file_operations coprocessor_debugfs_fops = {
+    .owner = THIS_MODULE,
+    .read = coprocessor_debugfs_read,
+    .write = coprocessor_debugfs_write,
+};
+@<Coprocessor Hardware Interface@>=
+// PCIe probe for coprocessor hardware
+static int coprocessor_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
+    pr_info("%s: PCIe coprocessor detected\n", COPROCESSOR_NAME);
+    coprocessor.dev = &pdev->dev;
+    coprocessor.active = true;
+    coprocessor.simulate = false; // Disable simulation with hardware
+    return 0;
+}
+// PCIe removal
+static void coprocessor_pcie_remove(struct pci_dev *pdev) {
+    pr_info("%s: PCIe coprocessor removed\n", COPROCESSOR_NAME);
+    coprocessor.active = false;
+    coprocessor.simulate = true; // Fall back to simulation
+    coprocessor.dev = NULL;
+}
+// PCIe device IDs (placeholder)
+static const struct pci_device_id coprocessor_pcie_id_table[] = {
+    { PCI_DEVICE(0x1234, 0x5678) }, // Vendor/device ID
+    { 0 }
+};
+// PCIe driver
+static struct pci_driver coprocessor_pcie_driver = {
+    .name = COPROCESSOR_NAME,
+    .id_table = coprocessor_pcie_id_table,
+    .probe = coprocessor_pcie_probe,
+    .remove = coprocessor_pcie_remove,
+};
+@<Coprocessor Simulation@>=
+// Simulate instruction execution for testing without hardware
+static int simulate_instruction(t81_coprocessor_instr_t *instr, t81_coprocessor_reg_t *regs) {
+    t81_coprocessor_reg_t *dst = &regs[instr->dst_reg];
+    t81_coprocessor_reg_t *src1 = &regs[instr->src1_reg];
+    t81_coprocessor_reg_t *src2 = &regs[instr->src2_reg];
+
+switch (instr->opcode) {
+case TADD:
+    dst->value = (src1->value + src2->value) % 3;
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TSUB:
+    dst->value = (src1->value - src2->value + 3) % 3;
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TMUL:
+    dst->value = (src1->value * src2->value) % 3;
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TNEG:
+    dst->value = (src1->value == 1) ? -1 : (src1->value == -1) ? 1 : 0;
+    dst->entropy = default_gen_entropy(src1->entropy, 0);
+    break;
+case TENT:
+    dst->value = src1->value;
+    dst->entropy = default_gen_entropy(src1->entropy, 0);
+    break;
+case TSEL:
+    dst->value = src1->value != TERN_LOW ? src2->value : regs[instr->src2_reg + 1].value;
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TMARKOV:
+    dst->value = (src1->value + src2->value) % 3;
+    dst->entropy = default_gen_entropy(src1->entropy, src2->entropy);
+    break;
+case TSYM:
+    dst->value = src1->value;
+    dst->entropy = default_gen_entropy(src1->entropy, 0);
+    break;
+default:
+    return -EINVAL;
+}
+return 0;
+
+}
+@<Coprocessor Module Lifecycle@>=
+// Module initialization
+static int __init ternary_coprocessor_init(void) {
+    int ret;
+    pr_info("%s: Initializing ternary coprocessor\n", COPROCESSOR_NAME);
+
+// Check configuration
+if (!hvm_config.enable_ternary_coprocessor) {
+    pr_err("%s: Coprocessor disabled in configuration\n", COPROCESSOR_NAME);
+    return -EINVAL;
+}
+
+// Initialize state
+ret = coprocessor_init_state();
+if (ret)
+    return ret;
+
+// Register character device
+ret = alloc_chrdev_region(&coprocessor_dev, 0, 1, DEVICE_NAME);
+if (ret < 0) {
+    pr_err("%s: chrdev allocation failed\n", COPROCESSOR_NAME);
+    return ret;
+}
+
+cdev_init(&coprocessor_cdev, &coprocessor_fops);
+ret = cdev_add(&coprocessor_cdev, coprocessor_dev, 1);
+if (ret < 0) {
+    unregister_chrdev_region(coprocessor_dev, 1);
+    pr_err("%s: cdev add failed\n", COPROCESSOR_NAME);
+    return ret;
+}
+
+// Create device class
+coprocessor_class = class_create(THIS_MODULE, CLASS_NAME);
+if (IS_ERR(coprocessor_class)) {
+    cdev_del(&coprocessor_cdev);
+    unregister_chrdev_region(coprocessor_dev, 1);
+    pr_err("%s: class creation failed\n", COPROCESSOR_NAME);
+    return PTR_ERR(coprocessor_class);
+}
+
+// Create device
+coprocessor_device = device_create(coprocessor_class, NULL, coprocessor_dev, NULL, DEVICE_NAME);
+if (IS_ERR(coprocessor_device)) {
+    class_destroy(coprocessor_class);
+    cdev_del(&coprocessor_cdev);
+    unregister_chrdev_region(coprocessor_dev, 1);
+    pr_err("%s: device creation failed\n", COPROCESSOR_NAME);
+    return PTR_ERR(coprocessor_device);
+}
+
+// Register PCIe driver
+ret = pci_register_driver(&coprocessor_pcie_driver);
+if (ret) {
+    device_destroy(coprocessor_class, coprocessor_dev);
+    class_destroy(coprocessor_class);
+    cdev_del(&coprocessor_cdev);
+    unregister_chrdev_region(coprocessor_dev, 1);
+    pr_err("%s: PCIe driver registration failed\n", COPROCESSOR_NAME);
+    return ret;
+}
+
+// Create DebugFS interface
+debugfs_file = debugfs_create_file(COPROCESSOR_NAME, 0600, NULL, NULL, &coprocessor_debugfs_fops);
+if (!debugfs_file) {
+    pci_unregister_driver(&coprocessor_pcie_driver);
+    device_destroy(coprocessor_class, coprocessor_dev);
+    class_destroy(coprocessor_class);
+    cdev_del(&coprocessor_cdev);
+    unregister_chrdev_region(coprocessor_dev, 1);
+    pr_err("%s: debugfs creation failed\n", COPROCESSOR_NAME);
+    return -ENOMEM;
+}
+
+return 0;
+
+}
+// Module cleanup
+static void __exit ternary_coprocessor_exit(void) {
+    debugfs_remove(debugfs_file);
+    pci_unregister_driver(&coprocessor_pcie_driver);
+    device_destroy(coprocessor_class, coprocessor_dev);
+    class_destroy(coprocessor_class);
+    cdev_del(&coprocessor_cdev);
+    unregister_chrdev_region(coprocessor_dev, 1);
+    mutex_destroy(&coprocessor.lock);
+    pr_info("%s: Ternary coprocessor exiting\n", COPROCESSOR_NAME);
+}
+module_init(ternary_coprocessor_init);
+module_exit(ternary_coprocessor_exit);
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("HanoiVM Team");
+MODULE_DESCRIPTION("HanoiVM Ternary Coprocessor Driver");
+@<Ternary Coprocessor Tutorial@>=
+// The ternary coprocessor executes T81 instructions (TADD, TMUL, TNEG, TENT, etc.)
+// on 81 registers (R0-R80), supporting T81Lang programs. It integrates with
+// ternary_arithmetic_optimization.cweb for arithmetic operations.
+// Example T81Lang program:
+//   tadd R0, R1, R2  ; R0 = R1 + R2 (mod 3)
+//   tmul R3, R0, R4  ; R3 = R0 * R4 (mod 3)
+//   tneg R5, R3      ; R5 = -R3
+// LLVM IR mappings (from ternary_arithmetic_optimization.cweb):
+//   %0 = add i32 %1, %2  -> tadd R0, R1, R2
+//   %3 = mul i32 %0, %4  -> tmul R3, R0, R4
+//   %5 = sub i32 0, %3   -> tneg R5, R3
+// DebugFS usage:
+//   echo "tadd 0 1 2" > /sys/kernel/debug/hanoivm_coprocessor
+//   cat /sys/kernel/debug/hanoivm_coprocessor
+// Outputs JSON, e.g.:
+//   {"cycle_count":1,"registers":[{"R0":{"value":1,"entropy":0x10}},...],"queue_size":0,"last_instruction":"tadd R0, R1, R2"}
+// IOCTL usage (from ternary_arithmetic_optimization.cweb):
+//   queue_ternary_addition(0, 1, 2); // R0 = R1 + R2
+//   execute_coprocessor_operations();
+// Simulation mode enables testing without hardware:
+//   coprocessor.simulate = true;
+@* End of ternary_coprocessor.cweb
+

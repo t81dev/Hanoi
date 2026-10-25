@@ -1,0 +1,71 @@
+@* T81Z Exporter: Symbolic Reasoning Trace to .t81z
+This program converts entropy-traced ternary reasoning paths into a .t81z binary file for long-term storage and replay by HanoiVM systems.
+
+@s trit int
+@s T81ZHeader struct
+@s json_t int
+
+@*1 Include Dependencies
+@c
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <json-c/json.h>
+#include <math.h>
+
+typedef int8_t trit; // -1, 0, +1
+
+@*1 Define T81Z Header
+@c
+typedef struct {
+  char magic[4];    // 'T81Z'
+  uint8_t version;  // Format version
+  uint16_t count;   // Number of paths
+  uint32_t total_trits;
+} T81ZHeader;
+
+@*1 Write T81Z File
+@c
+void write_t81z(const char *input_json, const char *output_file) {
+  json_object *root = json_object_from_file(input_json);
+  if (!root || !json_object_is_type(root, json_type_array)) {
+    fprintf(stderr, "Invalid input JSON.\n");
+    return;
+  }
+
+  FILE *fout = fopen(output_file, "wb");
+  if (!fout) {
+    perror("fopen");
+    return;
+  }
+
+  T81ZHeader header = { .magic = "T81Z", .version = 1, .count = 0, .total_trits = 0 };
+  fwrite(&header, sizeof(T81ZHeader), 1, fout);
+
+  size_t num_paths = json_object_array_length(root);
+  for (size_t i = 0; i < num_paths; i++) {
+    json_object *entry = json_object_array_get_idx(root, i);
+    json_object *path_arr = json_object_object_get(entry, "path");
+    if (!path_arr || !json_object_is_type(path_arr, json_type_array)) continue;
+
+    uint8_t path_len = (uint8_t) json_object_array_length(path_arr);
+    fwrite(&path_len, sizeof(uint8_t), 1, fout);
+
+    for (size_t j = 0; j < path_len; j++) {
+      int t = json_object_get_int(json_object_array_get_idx(path_arr, j));
+      trit tr = (t == 0) ? 0 : ((t > 0) ? +1 : -1);
+      fwrite(&tr, sizeof(trit), 1, fout);
+      header.total_trits++;
+    }
+
+    header.count++;
+  }
+
+  fseek(fout, 0, SEEK_SET);
+  fwrite(&header, sizeof(T81ZHeader), 1, fout);
+  fclose(fout);
+  json_object_put(root);
+
+  printf("Exported %u ternary paths (%u trits) to %s\n", header.count, header.total_trits, output_file);
+}

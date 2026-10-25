@@ -1,0 +1,104 @@
+@* nlp_query_bridge.cweb | Natural Language Query Bridge to TISC Symbolic Ops *@
+
+This module bridges NLP query input with the symbolic opcode dispatcher.
+It uses lightweight pattern matching and entropy scoring to map English commands
+into TISC instructions or Axion macro invocations.
+
+Integrated with:
+- `TISCQueryCompiler.cweb`
+- `axion_api.h`
+- `symbolic_trace.cweb`
+
+Accessible via `/sys/kernel/debug/nlp-query` for symbolic NLP inspection.
+
+@c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/debugfs.h>
+#include <linux/uaccess.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include "axion_api.h"
+#include "tisc_query_compiler.h"
+
+#define NLP_NODE "nlp-query"
+#define MAX_QUERY_LEN 256
+
+static struct dentry *nlp_debug_node;
+static char last_input[MAX_QUERY_LEN];
+static char nlp_response[512];
+
+@<Simple NLP → Symbolic Mapper@>=
+static const char* map_query_to_opcode(const char* query) {
+    if (strstr(query, "matrix multiply") || strstr(query, "matmul"))
+        return "T81_MATMUL";
+    if (strstr(query, "intent") && strstr(query, "forecast"))
+        return "T729_INTENT";
+    if (strstr(query, "fft"))
+        return "T729_HOLO_FFT";
+    if (strstr(query, "collapse") || strstr(query, "rollback"))
+        return "AXION_ROLLBACK";
+    if (strstr(query, "optimize"))
+        return "AXION_OPTIMIZE";
+    return "NOP";
+}
+
+@<Symbolic NLP Handler@>=
+void handle_nlp_query(const char* input) {
+    const char* opcode = map_query_to_opcode(input);
+    snprintf(nlp_response, sizeof(nlp_response),
+        "{\n"
+        "  \"input\": \"%s\",\n"
+        "  \"symbolic_opcode\": \"%s\",\n"
+        "  \"entropy_score\": %d,\n"
+        "  \"intent_label\": \"%s\"\n"
+        "}\n",
+        input,
+        opcode,
+        axion_entropy_score(opcode),
+        axion_intent_label(opcode));
+}
+
+@<DebugFS Interface@>=
+static ssize_t nlp_write(struct file *file, const char __user *ubuf,
+                         size_t count, loff_t *ppos) {
+    if (count >= MAX_QUERY_LEN) return -EINVAL;
+    if (copy_from_user(last_input, ubuf, count)) return -EFAULT;
+    last_input[count] = '\0';
+    handle_nlp_query(last_input);
+    return count;
+}
+
+static ssize_t nlp_read(struct file *file, char __user *ubuf,
+                        size_t count, loff_t *ppos) {
+    if (*ppos > 0) return 0;
+    size_t len = strlen(nlp_response);
+    if (copy_to_user(ubuf, nlp_response, len)) return -EFAULT;
+    *ppos = len;
+    return len;
+}
+
+static const struct file_operations nlp_fops = {
+    .owner = THIS_MODULE,
+    .read = nlp_read,
+    .write = nlp_write
+};
+
+@<Module Init/Exit@>=
+static int __init nlp_query_init(void) {
+    pr_info("[nlp-query] NLP bridge active\n");
+    nlp_debug_node = debugfs_create_file(NLP_NODE, 0666, NULL, NULL, &nlp_fops);
+    return nlp_debug_node ? 0 : -ENOMEM;
+}
+
+static void __exit nlp_query_exit(void) {
+    debugfs_remove(nlp_debug_node);
+    pr_info("[nlp-query] NLP bridge shut down\n");
+}
+
+module_init(nlp_query_init);
+module_exit(nlp_query_exit);
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("HanoiVM + Axion AI Team");
+MODULE_DESCRIPTION("Natural Language to Symbolic Opcode Bridge for TISC Queries");

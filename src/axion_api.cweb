@@ -1,0 +1,217 @@
+@* axion_api.cweb | Axion AI Stub API for Recursion Optimization
+
+This module provides an AI-driven API for recursion optimization in the HanoiVM ecosystem,
+analyzing stack frames and suggesting optimizations for T81/T243/T729 operations. It integrates
+with `hanoivm_fsm.v` via PCIe/M.2, `axion-ai.cweb` via ioctls/debugfs, `hanoivm-core.cweb` and
+`hanoivm-runtime.cweb` via FFI, `hanoivm_vm.cweb`’s execution core, `hanoivm_firmware.cweb`’s
+firmware, `axion-gaia-interface.cweb`’s GPU dispatch, and `advanced_ops.cweb`/`advanced_ops_ext.cweb` opcodes.
+
+Enhancements:
+- Support for recursive opcodes (`RECURSE_FACT`, `RECURSE_FIB`) and T729 intents.
+- Modular optimization table for extensibility.
+- Entropy logging via `axion-ai.cweb`’s debugfs.
+- Session memory integration with `axion-ai.cweb`’s `axion_session_t`.
+- FFI interface to `hanoivm-core.cweb` (Rust) and `hanoivm-runtime.cweb` (C).
+- Secure validation for stack, context, and recursion depth.
+- JSON visualization for annotations and optimization scores.
+- Support for `.hvm` test bytecode (`RECURSE_FACT` + `T81_MATMUL`).
+- Optimized for AI-driven recursion analysis.
+
+@c
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+#include <stdio.h>
+#include "axion_api.h"
+#include "axion-ai.h"
+#include "hanoivm_core.h"
+#include "hanoivm_runtime.h"
+#include "hanoivm_vm.h"
+
+#define MAX_LOG_MSG 128
+#define MAX_ANNOTATION 64
+
+@<Optimization Strategy Table@>=
+typedef struct {
+    const char* type;
+    void (*annotate)(HVMContext* ctx, char* out, size_t max_len);
+    double (*score)(HVMContext* ctx);
+    bool (*suggest)(HVMContext* ctx);
+    const char* name;
+} AxionOptStrategy;
+
+static void annotate_base(HVMContext* ctx, char* out, size_t max_len) {
+    strncpy(out, "Base case detected", max_len);
+    axion_log_entropy("ANNOTATE_BASE", ctx->recursion_depth);
+}
+
+static double score_base(HVMContext* ctx) {
+    return 1.0;
+}
+
+static bool suggest_base(HVMContext* ctx) {
+    return ctx->recursion_depth == 0;
+}
+
+static void annotate_tail(HVMContext* ctx, char* out, size_t max_len) {
+    strncpy(out, "Tail recursion detected", max_len);
+    axion_log_entropy("ANNOTATE_TAIL", ctx->recursion_depth);
+}
+
+static double score_tail(HVMContext* ctx) {
+    double normalized_depth = (double)ctx->recursion_depth / 729.0;
+    return 1.0 - fmin(1.0, normalized_depth);
+}
+
+static bool suggest_tail(HVMContext* ctx) {
+    return ctx->recursion_depth > 0 && ctx->call_depth > 0;
+}
+
+static AxionOptStrategy strategies[] = {
+    { "base", annotate_base, score_base, suggest_base, "BASE_CASE" },
+    { "tail", annotate_tail, score_tail, suggest_tail, "TAIL_RECURSION" },
+    // More in Part 2
+    { NULL, NULL, NULL, NULL, NULL }
+};
+
+@<Optimization Strategy Implementations@>=
+static void annotate_standard(HVMContext* ctx, char* out, size_t max_len) {
+    snprintf(out, max_len, "Standard recursive call (depth %d)", ctx->recursion_depth);
+    axion_log_entropy("ANNOTATE_STANDARD", ctx->recursion_depth);
+}
+
+static double score_standard(HVMContext* ctx) {
+    double normalized_depth = (double)ctx->recursion_depth / 243.0;
+    return fmax(0.0, 1.0 - normalized_depth);
+}
+
+static bool suggest_standard(HVMContext* ctx) {
+    return ctx->recursion_depth > 0 && ctx->call_depth <= ctx->recursion_depth;
+}
+
+static void annotate_gpu(HVMContext* ctx, char* out, size_t max_len) {
+    snprintf(out, max_len, "GPU-accelerated recursion (mode %d)", ctx->mode);
+    axion_log_entropy("ANNOTATE_GPU", ctx->mode);
+}
+
+static double score_gpu(HVMContext* ctx) {
+    return ctx->mode >= MODE_T729 ? 0.9 : 0.5;
+}
+
+static bool suggest_gpu(HVMContext* ctx) {
+    extern int rust_t729_intent_dispatch(int8_t opcode);
+    return ctx->mode >= MODE_T729 && rust_t729_intent_dispatch(OP_T729_DOT);
+}
+
+static AxionOptStrategy strategies[] = {
+    { "base", annotate_base, score_base, suggest_base, "BASE_CASE" },
+    { "tail", annotate_tail, score_tail, suggest_tail, "TAIL_RECURSION" },
+    { "standard", annotate_standard, score_standard, suggest_standard, "STANDARD_RECURSION" },
+    { "gpu", annotate_gpu, score_gpu, suggest_gpu, "GPU_RECURSION" },
+    { NULL, NULL, NULL, NULL, NULL }
+};
+
+@<Core Optimization Functions@>=
+void axion_frame_optimize(HVMContext* ctx, char* out_annotation, size_t max_len) {
+    if (!ctx || !out_annotation || max_len < MAX_ANNOTATION) {
+        axion_log_entropy("OPTIMIZE_INVALID", 0xFF);
+        if (out_annotation) strncpy(out_annotation, "Invalid context", max_len);
+        return;
+    }
+    for (int i = 0; strategies[i].annotate; i++) {
+        if (strategies[i].suggest(ctx)) {
+            strategies[i].annotate(ctx, out_annotation, max_len);
+            return;
+        }
+    }
+    strncpy(out_annotation, "No optimization applicable", max_len);
+    axion_log_entropy("OPTIMIZE_NONE", ctx->recursion_depth);
+}
+
+double axion_predict_score(HVMContext* ctx) {
+    if (!ctx) {
+        axion_log_entropy("SCORE_INVALID", 0xFF);
+        return 0.0;
+    }
+    for (int i = 0; strategies[i].score; i++) {
+        if (strategies[i].suggest(ctx))
+            return strategies[i].score(ctx);
+    }
+    axion_log_entropy("SCORE_DEFAULT", ctx->recursion_depth);
+    return 0.5;
+}
+
+bool axion_suggest_tail_collapse(HVMContext* ctx) {
+    if (!ctx) {
+        axion_log_entropy("TAIL_INVALID", 0xFF);
+        return false;
+    }
+    bool result = strategies[1].suggest(ctx); // Tail recursion strategy
+    axion_log_entropy("TAIL_SUGGEST", result);
+    return result;
+}
+
+@<Integration Hooks@>=
+void axion_optimize_recursive_op(HVMContext* ctx, uint8_t opcode) {
+    if (opcode == OP_RECURSE_FACT || opcode == OP_RECURSE_FIB) {
+        char annotation[MAX_ANNOTATION];
+        axion_frame_optimize(ctx, annotation, sizeof(annotation));
+        double score = axion_predict_score(ctx);
+        bool tail = axion_suggest_tail_collapse(ctx);
+        char log_msg[128];
+        snprintf(log_msg, sizeof(log_msg), "Opcode 0x%02X: %s (score %.2f, tail %d)",
+                 opcode, annotation, score, tail);
+        axion_log_entropy("RECURSIVE_OP", opcode);
+    }
+}
+
+void axion_gpu_hook_optimize(HVMContext* ctx, T729Macro* macro) {
+    if (macro->intent == GAIA_T729_DOT && ctx->mode >= MODE_T729) {
+        char annotation[MAX_ANNOTATION];
+        axion_frame_optimize(ctx, annotation, sizeof(annotation));
+        GAIAResponse res = dispatch_macro_extended(macro, -1);
+        if (res.success) {
+            axion_log_entropy("GPU_OPTIMIZE_SUCCESS", macro->intent);
+        } else {
+            axion_log_entropy("GPU_OPTIMIZE_FAIL", macro->intent);
+        }
+    }
+}
+
+@<Visualization Hook@>=
+void axion_visualize_optimization(HVMContext* ctx, char* out_json, size_t max_len) {
+    char annotation[MAX_ANNOTATION];
+    axion_frame_optimize(ctx, annotation, sizeof(annotation));
+    double score = axion_predict_score(ctx);
+    bool tail = axion_suggest_tail_collapse(ctx);
+    size_t len = snprintf(out_json, max_len,
+        "{\"recursion_depth\": %d, \"mode\": %d, \"annotation\": \"%s\", "
+        "\"score\": %.2f, \"tail_collapse\": %d}",
+        ctx->recursion_depth, ctx->mode, annotation, score, tail);
+    axion_log_entropy("VISUALIZE_OPTIMIZE", len & 0xFF);
+}
+
+@<Test Main@>=
+int main(void) {
+    HVMContext ctx = {
+        .ip = 0, .halted = 0, .recursion_depth = 5,
+        .mode = MODE_T729, .call_depth = 3
+    };
+    char annotation[MAX_ANNOTATION];
+    axion_frame_optimize(&ctx, annotation, sizeof(annotation));
+    double score = axion_predict_score(&ctx);
+    bool tail = axion_suggest_tail_collapse(&ctx);
+    printf("Annotation: %s\nScore: %.2f\nTail Collapse: %d\n",
+           annotation, score, tail);
+
+    T729Macro macro = {
+        .macro_id = 42, .intent = GAIA_T729_DOT,
+        .input = { -1, 0, 1, -1, 0, 1 }
+    };
+    axion_gpu_hook_optimize(&ctx, &macro);
+
+    char json[256];
+    axion_visualize_optimization(&ctx, json, sizeof(json));
+    printf("JSON: %s\n", json);
+    return 0;
+}

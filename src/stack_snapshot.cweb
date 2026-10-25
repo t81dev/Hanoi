@@ -1,0 +1,88 @@
+@* stack_snapshot.cweb | HanoiVM Stack Snapshot Exporter (DebugFS Interface) *@
+
+This module exports a real-time JSON snapshot of the current ternary stack state,
+including symbolic operands, Axion AI metadata, and tiered operand classifications.
+
+Access: `/sys/kernel/debug/stack-snapshot`
+
+@c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/debugfs.h>
+#include <linux/uaccess.h>
+#include <linux/slab.h>
+#include "hanoivm_stack.h"
+#include "hanoivm_vm.h"
+#include "axion_api.h"
+
+#define STACK_NODE "stack-snapshot"
+#define SNAPSHOT_BUF_SIZE 4096
+
+static struct dentry *stack_debug_node;
+static char snapshot_buf[SNAPSHOT_BUF_SIZE];
+
+@<Stack Snapshot Generator@>=
+static void generate_stack_snapshot(HVMContext* ctx) {
+    int sp = stack_state.sp;
+
+    snprintf(snapshot_buf, SNAPSHOT_BUF_SIZE,
+        "{\n"
+        "  \"stackDepth\": %d,\n"
+        "  \"recursionTier\": \"%s\",\n"
+        "  \"ai_entropy\": %d,\n"
+        "  \"frames\": [\n",
+        sp + 1,
+        (ctx->tier_mode == 729 ? "T729" : ctx->tier_mode == 243 ? "T243" : "T81"),
+        get_entropy_tau27());
+
+    for (int i = 0; i <= sp; i++) {
+        T81Datum* d = &stack_state.stack[i];
+        char* typename = t81_type_name(d->type);
+        char* valstr = t81_to_string(d);
+
+        snprintf(snapshot_buf + strlen(snapshot_buf), SNAPSHOT_BUF_SIZE - strlen(snapshot_buf),
+            "    { \"index\": %d, \"type\": \"%s\", \"value\": \"%s\" }%s\n",
+            i, typename, valstr, (i == sp ? "" : ","));
+
+        kfree(valstr);  // Assuming t81_to_string allocates memory
+    }
+
+    snprintf(snapshot_buf + strlen(snapshot_buf), SNAPSHOT_BUF_SIZE - strlen(snapshot_buf),
+        "  ]\n"
+        "}\n");
+}
+
+@<DebugFS Interface@>=
+static ssize_t snapshot_read(struct file *file, char __user *ubuf,
+                             size_t count, loff_t *ppos) {
+    if (*ppos > 0) return 0;
+    generate_stack_snapshot(get_hvm_context());
+    size_t len = strlen(snapshot_buf);
+    if (copy_to_user(ubuf, snapshot_buf, len)) return -EFAULT;
+    *ppos = len;
+    return len;
+}
+
+static const struct file_operations snapshot_fops = {
+    .owner = THIS_MODULE,
+    .read = snapshot_read
+};
+
+@<Module Lifecycle@>=
+static int __init stack_snapshot_init(void) {
+    pr_info("[stack-snapshot] HanoiVM stack inspector loaded\n");
+    stack_debug_node = debugfs_create_file(STACK_NODE, 0444, NULL, NULL, &snapshot_fops);
+    return stack_debug_node ? 0 : -ENOMEM;
+}
+
+static void __exit stack_snapshot_exit(void) {
+    debugfs_remove(stack_debug_node);
+    pr_info("[stack-snapshot] Stack inspector unloaded\n");
+}
+
+module_init(stack_snapshot_init);
+module_exit(stack_snapshot_exit);
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("HanoiVM + Axion AI Team");
+MODULE_DESCRIPTION("DebugFS live ternary stack snapshot for symbolic analysis");

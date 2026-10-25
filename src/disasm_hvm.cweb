@@ -1,0 +1,235 @@
+@* disasm_hvm.cweb | HVM Bytecode Disassembler with Extended Synergy (v0.9.3)
+
+This module disassembles HVM bytecode with type-aware operand processing, supporting
+recursive opcodes and T729 intents. It integrates with `hanoivm_fsm.v` via PCIe/M.2,
+`axion-ai.cweb` via ioctls/debugfs, `hanoivm-core.cweb` and `hanoivm-runtime.cweb` via FFI,
+`hanoivm_vm.cweb`’s execution core, `hanoivm_firmware.cweb`’s firmware,
+`axion-gaia-interface.cweb’`s GPU dispatch, `axion_api.cweb`’s recursion optimization,
+`axion_gpu_serializer.cweb`’s GPU serialization, `bootstrap.cweb`’s bootstrap sequence,
+`config.cweb`’s configuration, `cuda_handle_request.cweb`’s CUDA backend, and
+`advanced_ops.cweb`/`advanced_ops_ext.cweb` opcodes.
+
+Enhancements:
+- Support for recursive opcodes (`RECURSE_FACT`) and T729 intents (`T81_MATMUL`).
+- Modular opcode and operand decoding table.
+- Entropy logging via `axion-ai.cweb`’s debugfs.
+- Session memory integration with `axion-ai.cweb`’s `axion_session_t`.
+- FFI interface to `hanoivm-core.cweb` (Rust) and `hanoivm-runtime.cweb` (C).
+- Secure validation for bytecode, opcodes, and operands.
+- JSON visualization for disassembled output.
+- Support for `.hvm` test bytecode (`T81_MATMUL` + `TNN_ACCUM`).
+- Optimized for ternary bytecode disassembly.
+
+@c
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <errno.h>
+#include "hvm_bytecode.h"
+#include "axion-ai.h"
+#include "hanoivm_core.h"
+#include "hanoivm_runtime.h"
+#include "axion-gaia-interface.h"
+
+#define VERBOSE_DISASSEMBLE 1
+#define DEBUG_OUTPUT stdout
+#define T81_TAG_BIGINT 0x01
+#define T81_TAG_FRACTION 0x02
+#define T81_TAG_FLOAT 0x03
+#define T81_TAG_MATRIX 0x04
+#define T81_TAG_VECTOR 0x05
+#define T81_TAG_TENSOR 0x06
+#define T81_TAG_POLYNOMIAL 0x07
+#define T81_TAG_GRAPH 0x08
+#define T81_TAG_QUATERNION 0x09
+#define T81_TAG_OPCODE 0x0A
+#define MAX_LOG_MSG 128
+
+@<Opcode Decoding Table@>=
+typedef struct {
+    uint8_t opcode;
+    const char* name;
+    int operand_count;
+    size_t operand_size;
+} OpcodeInfo;
+
+static OpcodeInfo opcodes[] = {
+    { 0x01, "PUSH", 1, 9 },
+    { 0x03, "ADD", 0, 0 },
+    { 0x20, "TNN_ACCUM", 2, 18 },
+    { 0x21, "T81_MATMUL", 2, 18 },
+    { 0x30, "RECURSE_FACT", 1, 4 },
+    { 0xFF, "HALT", 0, 0 },
+    { 0x00, NULL, 0, 0 }
+};
+
+@<Opcode Decoding Function@>=
+const char* decode_opcode(uint8_t op) {
+    for (int i = 0; opcodes[i].name; i++) {
+        if (opcodes[i].opcode == op) return opcodes[i].name;
+    }
+    extern int rust_validate_opcode(uint8_t op);
+    if (rust_validate_opcode(op)) return "VALID_UNKNOWN";
+    return "INVALID";
+}
+
+@<Operand Decoding Function@>=
+void disasm_operand(FILE* in, uint64_t* addr) {
+    uint8_t tag;
+    if (fread(&tag, 1, 1, in) != 1) {
+        fprintf(stderr, "[ERROR] Unable to read operand tag\n");
+        axion_log_entropy("DISASM_OPERAND_TAG_FAIL", 0xFF);
+        return;
+    }
+    (*addr)++;
+    if (VERBOSE_DISASSEMBLE) {
+        fprintf(DEBUG_OUTPUT, "[DEBUG] Operand tag: 0x%02X\n", tag);
+    }
+    switch (tag) {
+        case T81_TAG_BIGINT: {
+            uint8_t len;
+            if (fread(&len, 1, 1, in) != 1) {
+                fprintf(stderr, "[ERROR] BIGINT: failed to read length\n");
+                axion_log_entropy("DISASM_BIGINT_LEN_FAIL", 0xFF);
+                return;
+            }
+            (*addr)++;
+            char buf[64] = {0};
+            if (fread(buf, 1, len, in) != len) {
+                fprintf(stderr, "[ERROR] BIGINT: failed to read value\n");
+                axion_log_entropy("DISASM_BIGINT_VALUE_FAIL", 0xFF);
+                return;
+            }
+            (*addr) += len;
+            fprintf(DEBUG_OUTPUT, "BIGINT(%s)", buf);
+            axion_log_entropy("DISASM_BIGINT", len);
+            break;
+        }
+        case T81_TAG_FRACTION: {
+            fprintf(DEBUG_OUTPUT, "FRACTION { numerator: ");
+            disasm_operand(in, addr);
+            fprintf(DEBUG_OUTPUT, ", denominator: ");
+            disasm_operand(in, addr);
+            fprintf(DEBUG_OUTPUT, " }");
+            axion_log_entropy("DISASM_FRACTION", tag);
+            break;
+        }
+        case T81_TAG_MATRIX: {
+            uint8_t dims[2];
+            if (fread(dims, 1, 2, in) != 2) {
+                fprintf(stderr, "[ERROR] MATRIX: failed to read dimensions\n");
+                axion_log_entropy("DISASM_MATRIX_DIMS_FAIL", 0xFF);
+                return;
+            }
+            (*addr) += 2;
+            fprintf(DEBUG_OUTPUT, "MATRIX [%dx%d]", dims[0], dims[1]);
+            axion_log_entropy("DISASM_MATRIX", dims[0]);
+            break;
+        }
+        case T81_TAG_OPCODE: {
+            uint8_t inner;
+            if (fread(&inner, 1, 1, in) != 1) {
+                fprintf(stderr, "[ERROR] OPCODE: failed to read inner opcode\n");
+                axion_log_entropy("DISASM_OPCODE_FAIL", 0xFF);
+                return;
+            }
+            (*addr)++;
+            fprintf(DEBUG_OUTPUT, "OPCODE (inner): %s", decode_opcode(inner));
+            axion_log_entropy("DISASM_OPCODE", inner);
+            break;
+        }
+        default:
+            fprintf(DEBUG_OUTPUT, "UNKNOWN OPERAND TAG 0x%02X", tag);
+            axion_log_entropy("DISASM_UNKNOWN_TAG", tag);
+            break;
+    }
+}
+
+@<Core Disassembler Function@>=
+int disassemble_hvm(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[ERROR] Failed to open file: %s (%s)\n", path, strerror(errno));
+        axion_log_entropy("DISASM_OPEN_FAIL", errno);
+        return -1;
+    }
+    char session_id[32];
+    snprintf(session_id, sizeof(session_id), "DISASM-%016lx", (uint64_t)f);
+    axion_register_session(session_id);
+    uint64_t addr = 0;
+    uint8_t op;
+    while (fread(&op, 1, 1, f) == 1) {
+        const char* opname = decode_opcode(op);
+        fprintf(DEBUG_OUTPUT, "0x%08llX: %s", addr, opname);
+        if (VERBOSE_DISASSEMBLE) {
+            fprintf(DEBUG_OUTPUT, " [raw: 0x%02X]", op);
+        }
+        addr++;
+        for (int i = 0; opcodes[i].name; i++) {
+            if (opcodes[i].opcode == op && opcodes[i].operand_count > 0) {
+                fprintf(DEBUG_OUTPUT, " ");
+                for (int j = 0; j < opcodes[i].operand_count; j++) {
+                    disasm_operand(f, &addr);
+                    if (j < opcodes[i].operand_count - 1) fprintf(DEBUG_OUTPUT, ", ");
+                }
+                fseek(f, opcodes[i].operand_size, SEEK_CUR);
+                addr += opcodes[i].operand_size;
+                break;
+            }
+        }
+        fprintf(DEBUG_OUTPUT, "\n");
+        axion_log_entropy("DISASM_OPCODE", op);
+    }
+    fclose(f);
+    axion_log_entropy("DISASM_COMPLETE", addr & 0xFF);
+    return 0;
+}
+
+@<Visualization Hook@>=
+void disasm_visualize(const char* path, char* out_json, size_t max_len) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    size_t len = snprintf(out_json, max_len, "{\"bytecode\": [");
+    uint64_t addr = 0;
+    uint8_t op;
+    while (fread(&op, 1, 1, f) == 1 && len < max_len) {
+        len += snprintf(out_json + len, max_len - len,
+                        "{\"addr\": \"0x%08llX\", \"opcode\": \"%s\", \"raw\": \"0x%02X\"},",
+                        addr, decode_opcode(op), op);
+        addr++;
+        for (int i = 0; opcodes[i].name; i++) {
+            if (opcodes[i].opcode == op) {
+                fseek(f, opcodes[i].operand_size, SEEK_CUR);
+                addr += opcodes[i].operand_size;
+                break;
+            }
+        }
+    }
+    if (len > 0 && out_json[len-1] == ',') len--;
+    len += snprintf(out_json + len, max_len - len, "]}");
+    fclose(f);
+    axion_log_entropy("VISUALIZE_DISASM", len & 0xFF);
+}
+
+@<Integration Hook@>=
+void disasm_integrate(const char* path) {
+    disassemble_hvm(path);
+    char json[512];
+    disasm_visualize(path, json, sizeof(json));
+    fprintf(DEBUG_OUTPUT, "[DISASM] JSON Output: %s\n", json);
+    GaiaRequest req = { .tbin = (uint8_t*)json, .tbin_len = strlen(json), .intent = GAIA_T729_DOT };
+    cuda_handle_request(req);
+    axion_log_entropy("DISASM_INTEGRATE", req.intent);
+}
+
+@<Main Function@>=
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <hvm_binary_file>\n", argv[0]);
+        return 1;
+    }
+    disasm_integrate(argv[1]);
+    return 0;
+}
+

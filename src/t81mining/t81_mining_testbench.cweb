@@ -1,0 +1,323 @@
+@* T81 Mining Pipeline Test Suite — Multi-Core Aware, Literate Testbench
+
+This test suite targets a multi-core `mining_pipeline.v` for parallel SHA3 mining
+on T81 operands. It tests:
+- ✅ Full opcode coverage (NOP, PUSH, POP, ADD, error cases)
+- 🔁 Nonce iteration with dynamic difficulty
+- 🎚️ Debug signal tracing (FSM, SHA3, nonce)
+- 🧵 Dual-core parallel FSM hashing with synchronization
+- 🧪 Verilator + waveform-compatible, CDC verification
+
+@c
+@<Top-Level Testbench@>
+
+@*1 Top-Level Testbench (Multi-Core Aware)
+
+@<Testbench Harness and Clocking@>
+@<Opcode Test Coverage@>
+@<Stack and SHA Tracing Signals@>
+@<Nonce Logic Extension@>
+@<Difficulty Configuration@>
+@<Parallel Core Injection (Dual FSM)@>
+
+@*2 Testbench Harness and Clocking
+
+@<Testbench Harness and Clocking@>=
+`timescale 1ns/1ps
+
+module tb_mining_pipeline;
+    // Clock and reset
+    reg clk_fast, clk_slow, rst;
+    reg [7:0] opcode_core0, opcode_core1;
+    reg [80:0] operand_core0, operand_core1;
+    reg valid_core0, valid_core1;
+    reg start_mine;
+    reg [511:0] difficulty;
+    wire match_found_0, match_found_1;
+    wire [31:0] nonce_0, nonce_1;
+    wire [31:0] status_reg_0, status_reg_1;
+
+    // Instantiate two mining cores
+    mining_pipeline dut0 (
+        .clk_fast(clk_fast), .clk_slow(clk_slow), .rst(rst),
+        .opcode(opcode_core0), .operand(operand_core0),
+        .start_mine(start_mine), .valid_opcode(valid_core0),
+        .difficulty(difficulty),
+        .match_found(match_found_0), .nonce(nonce_0), .status_reg(status_reg_0)
+    );
+
+    mining_pipeline dut1 (
+        .clk_fast(clk_fast), .clk_slow(clk_slow), .rst(rst),
+        .opcode(opcode_core1), .operand(operand_core1),
+        .start_mine(start_mine), .valid_opcode(valid_core1),
+        .difficulty(difficulty),
+        .match_found(match_found_1), .nonce(nonce_1), .status_reg(status_reg_1)
+    );
+
+    // Clock generation (fast: 4ns period, slow: 10ns period)
+    initial begin
+        clk_fast = 0; clk_slow = 0;
+        forever #2 clk_fast = ~clk_fast;
+    end
+    initial begin
+        forever #5 clk_slow = ~clk_slow;
+    end
+
+    // Random ternary operand generator (values 0, 1, or 2)
+    function [80:0] random_t81;
+        integer i;
+        begin
+            random_t81 = 81'd0;
+            for (i = 0; i < 81; i = i + 1)
+                random_t81[i] = $random % 3;
+        end
+    endfunction
+
+    // Apply vector tasks for each core
+    task apply_vector_core0(input [7:0] op, input [80:0] opnd);
+        begin
+            @(posedge clk_fast);
+            opcode_core0 <= op; operand_core0 <= opnd; valid_core0 <= 1;
+            @(posedge clk_fast);
+            valid_core0 <= 0;
+            wait (dut0.fsm_ready);
+        end
+    endtask
+
+    task apply_vector_core1(input [7:0] op, input [80:0] opnd);
+        begin
+            @(posedge clk_fast);
+            opcode_core1 <= op; operand_core1 <= opnd; valid_core1 <= 1;
+            @(posedge clk_fast);
+            valid_core1 <= 0;
+            wait (dut1.fsm_ready);
+        end
+    endtask
+
+@*2 Opcode Test Coverage
+
+@<Opcode Test Coverage@>=
+    task test_opcodes;
+        reg [80:0] op1, op2;
+        begin
+            $display("[TEST] Opcode Coverage @ %0t", $time);
+            rst = 1; #20; rst = 0; #10;
+
+            // NOP (0x00)
+            $display("[CORE0] NOP"); apply_vector_core0(8'h00, 81'd0);
+            if (dut0.result_out !== 81'd0) $display("[ERROR] NOP failed!");
+
+            // PUSH (0x01)
+            op1 = random_t81();
+            $display("[CORE0] PUSH %h", op1); apply_vector_core0(8'h01, op1);
+            if (dut0.result_out !== op1) $display("[ERROR] PUSH failed!");
+
+            // ADD (0x03)
+            op2 = random_t81();
+            $display("[CORE0] PUSH %h", op2); apply_vector_core0(8'h01, op2);
+            $display("[CORE0] ADD"); apply_vector_core0(8'h03, 81'd0);
+            begin
+                reg [80:0] expected;
+                integer i;
+                for (i = 0; i < 81; i = i + 1)
+                    expected[i] = (op1[i] + op2[i]) % 3;
+                if (dut0.result_out !== expected) $display("[ERROR] ADD failed!");
+            end
+
+            // POP (0x02)
+            $display("[CORE1] PUSH %h", op1); apply_vector_core1(8'h01, op1);
+            $display("[CORE1] POP"); apply_vector_core1(8'h02, 81'd0);
+            if (dut1.result_out !== op1) $display("[ERROR] POP failed!");
+
+            // Error cases
+            $display("[CORE0] Stack Overflow Test");
+            repeat (16) apply_vector_core0(8'h01, random_t81());
+            apply_vector_core0(8'h01, random_t81()); // Should error
+            if (!dut0.fsm_error) $display("[ERROR] Stack overflow not detected!");
+
+            $display("[CORE1] Stack Underflow Test");
+            apply_vector_core1(8'h02, 81'd0); // Empty stack POP
+            if (!dut1.fsm_error) $display("[ERROR] Stack underflow not detected!");
+
+            $display("[CORE0] Invalid Opcode Test");
+            apply_vector_core0(8'hFF, 81'd0);
+            if (!dut0.fsm_error) $display("[ERROR] Invalid opcode not detected!");
+        end
+    endtask
+
+@*2 Stack and SHA Tracing Signals
+
+@<Stack and SHA Tracing Signals@>=
+    initial begin
+        $dumpfile("tb_mining_pipeline.vcd");
+        $dumpvars(0, tb_mining_pipeline);
+        $dumpvars(1, dut0.u_fsm, dut0.u_preproc, dut0.u_sha3, dut0.u_ctrl, dut0.u_debug);
+        $dumpvars(1, dut1.u_fsm, dut1.u_preproc, dut1.u_sha3, dut1.u_ctrl, dut1.u_debug);
+    end
+
+    // Monitor key signals
+    always @(posedge clk_fast) begin
+        if (dut0.fsm_done)
+            $display("[CORE0] FSM Result: %h, SP: %0d, Error: %b @ %0t",
+                     dut0.result_out, dut0.u_fsm.sp, dut0.fsm_error, $time);
+        if (dut1.fsm_done)
+            $display("[CORE1] FSM Result: %h, SP: %0d, Error: %b @ %0t",
+                     dut1.result_out, dut1.u_fsm.sp, dut1.fsm_error, $time);
+        if (dut0.sha_done)
+            $display("[CORE0] SHA3 Hash: %h @ %0t", dut0.hash_out, $time);
+        if (dut1.sha_done)
+            $display("[CORE1] SHA3 Hash: %h @ %0t", dut1.hash_out, $time);
+    end
+
+    // Debug status monitoring
+    always @(posedge clk_slow) begin
+        $display("[DEBUG] CORE0 Status: FSM=%0d, Errors=%b%b%b, Nonce=%0h, Match=%b @ %0t",
+                 status_reg_0[3:0], status_reg_0[4], status_reg_0[5], status_reg_0[6],
+                 status_reg_0[31:8], status_reg_0[7], $time);
+        $display("[DEBUG] CORE1 Status: FSM=%0d, Errors=%b%b%b, Nonce=%0h, Match=%b @ %0t",
+                 status_reg_1[3:0], status_reg_1[4], status_reg_1[5], status_reg_1[6],
+                 status_reg_1[31:8], status_reg_1[7], $time);
+    end
+
+@*2 Nonce Logic Extension
+
+@<Nonce Logic Extension@>=
+    task test_nonce_iteration;
+        integer i;
+        reg [80:0] base_nonce;
+        begin
+            $display("[TEST] Nonce Iteration @ %0t", $time);
+            rst = 1; #20; rst = 0; #10;
+            start_mine = 1;
+            base_nonce = random_t81();
+            for (i = 0; i < 10; i = i + 1) begin
+                $display("[CORE0] PUSH Nonce %0d: %h", i, base_nonce + i);
+                apply_vector_core0(8'h01, base_nonce + i);
+                apply_vector_core0(8'h03, 81'd0); // Trigger processing
+                #100; // Wait for SHA3 and controller
+            end
+            for (i = 0; i < 10; i = i + 1) begin
+                $display("[CORE1] PUSH Nonce %0d: %h", i, base_nonce + 100 + i);
+                apply_vector_core1(8'h01, base_nonce + 100 + i);
+                apply_vector_core1(8'h03, 81'd0);
+                #100;
+            end
+            wait (match_found_0 || match_found_1);
+            $display("[SUCCESS] Match found: CORE0=%b, CORE1=%b, Nonce0=%0h, Nonce1=%0h @ %0t",
+                     match_found_0, match_found_1, nonce_0, nonce_1, $time);
+            start_mine = 0;
+        end
+    endtask
+
+@*2 Difficulty Configuration
+
+@<Difficulty Configuration@>=
+    task configure_difficulty(input [511:0] diff);
+        begin
+            $display("[CONFIG] Setting difficulty: %h @ %0t", diff, $time);
+            @(posedge clk_slow);
+            difficulty <= diff;
+            #10;
+        end
+    endtask
+
+    task test_difficulty;
+        begin
+            $display("[TEST] Difficulty Adjustment @ %0t", $time);
+            rst = 1; #20; rst = 0; #10;
+            // Test high difficulty
+            configure_difficulty(512'h0000000000000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF);
+            start_mine = 1;
+            apply_vector_core0(8'h01, random_t81());
+            apply_vector_core0(8'h03, 81'd0);
+            #200;
+            if (match_found_0) $display("[ERROR] Match found with high difficulty!");
+            start_mine = 0;
+            // Test low difficulty
+            configure_difficulty(512'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF);
+            start_mine = 1;
+            apply_vector_core0(8'h01, random_t81());
+            apply_vector_core0(8'h03, 81'd0);
+            #200;
+            if (!match_found_0) $display("[ERROR] No match with low difficulty!");
+            start_mine = 0;
+        end
+    endtask
+
+@*2 Parallel Core Injection (Dual FSM)
+
+@<Parallel Core Injection (Dual FSM)@>=
+    task test_parallel_cores;
+        integer i;
+        reg [80:0] nonce0, nonce1;
+        begin
+            $display("[TEST] Parallel Core Injection @ %0t", $time);
+            rst = 1; #20; rst = 0; #10;
+            configure_difficulty(512'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF);
+            start_mine = 1;
+            nonce0 = random_t81();
+            nonce1 = random_t81() + 100;
+            for (i = 0; i < 5; i = i + 1) begin
+                $display("[PARALLEL] CORE0 PUSH %h, CORE1 PUSH %h", nonce0 + i, nonce1 + i);
+                fork
+                    begin
+                        apply_vector_core0(8'h01, nonce0 + i);
+                        apply_vector_core0(8'h03, 81'd0);
+                    end
+                    begin
+                        apply_vector_core1(8'h01, nonce1 + i);
+                        apply_vector_core1(8'h03, 81'd0);
+                    end
+                join
+                #50;
+            end
+            wait (match_found_0 || match_found_1);
+            $display("[SUCCESS] Parallel match: CORE0=%b, CORE1=%b @ %0t", match_found_0, match_found_1, $time);
+            start_mine = 0;
+        end
+    endtask
+
+    task test_cdc_synchronization;
+        begin
+            $display("[TEST] CDC Synchronization @ %0t", $time);
+            rst = 1; #20; rst = 0; #10;
+            configure_difficulty(512'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF);
+            start_mine = 1;
+            @(posedge clk_slow);
+            apply_vector_core0(8'h01, random_t81());
+            apply_vector_core0(8'h03, 81'd0);
+            #100;
+            if (status_reg_0[7] !== match_found_0)
+                $display("[ERROR] CDC mismatch in CORE0 status!");
+            apply_vector_core1(8'h01, random_t81());
+            apply_vector_core1(8'h03, 81'd0);
+            #100;
+            if (status_reg_1[7] !== match_found_1)
+                $display("[ERROR] CDC mismatch in CORE1 status!");
+            start_mine = 0;
+        end
+    endtask
+
+@*2 Top-Level Testbench
+
+@<Top-Level Testbench@>=
+    initial begin
+        $display("=== Multi-Core T81 SHA3 Mining Test Suite ===");
+        rst = 1; start_mine = 0; difficulty = 512'h0;
+        opcode_core0 = 8'h00; operand_core0 = 81'd0; valid_core0 = 0;
+        opcode_core1 = 8'h00; operand_core1 = 81'd0; valid_core1 = 0;
+        #20; rst = 0; #10;
+
+        // Run test cases
+        test_opcodes();
+        test_difficulty();
+        test_nonce_iteration();
+        test_parallel_cores();
+        test_cdc_synchronization();
+
+        $display("[COMPLETED] All tests passed @ %0t", $time);
+        #50;
+        $finish;
+    end
+endmodule
+

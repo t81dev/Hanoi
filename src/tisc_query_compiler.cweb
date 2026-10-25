@@ -1,0 +1,98 @@
+@* TISC Query Compiler |tisc_query_compiler.cweb|.
+
+This module translates user queries—natural language or symbolic—
+into executable TISC operations for HanoiVM. It is entropy-aware,
+stack-sensitive, and recursive by design.
+
+@p
+#include "t81lang_parser.h"
+#include "t81graph.h"
+#include "t81stack.h"
+#include "t81entropy.h"
+#include "tisc_ops.h"
+#include "t81symbol_table.h"
+
+@d MAX_QUERY_LENGTH 1024
+@d TISC_QUERY_VERSION "0.1.0"
+
+@q
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+  TISC Query Compiler
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+@>
+
+@*1 Data Structures.
+
+We define the basic unit of a compiled query, the |TISCQuery| struct,
+which maintains symbolic tokens, compiled ops, and entropy rating.
+
+@<Define TISCQuery structure@> =
+typedef struct {
+    char raw_input[MAX_QUERY_LENGTH];
+    T81TokenizedList *token_list;
+    TISC_Opcode *compiled_ops;
+    float entropy_score;
+    T81SymbolContext *symctx;
+} TISCQuery;
+
+@*1 Core Functions.
+
+@<Initialize TISCQuery@> =
+TISCQuery *init_tisc_query(const char *input) {
+    TISCQuery *q = (TISCQuery *)malloc(sizeof(TISCQuery));
+    strncpy(q->raw_input, input, MAX_QUERY_LENGTH);
+    q->token_list = tokenize_t81(input);
+    q->compiled_ops = NULL;
+    q->entropy_score = 0.0;
+    q->symctx = create_symbol_context();
+    return q;
+}
+
+@<Compile token list to TISC ops@> =
+void compile_to_tisc(TISCQuery *query) {
+    int len = query->token_list->count;
+    query->compiled_ops = (TISC_Opcode *)malloc(sizeof(TISC_Opcode) * len);
+
+    for (int i = 0; i < len; ++i) {
+        char *tok = query->token_list->tokens[i];
+        if (is_keyword(tok)) {
+            query->compiled_ops[i] = OP_LOOKUP;
+        } else if (is_entity(tok)) {
+            query->compiled_ops[i] = OP_TAG;
+        } else {
+            query->compiled_ops[i] = OP_HINT;
+        }
+    }
+
+    query->entropy_score = evaluate_entropy(query->compiled_ops, len);
+}
+
+@*1 Execution Interface.
+
+@<Evaluate compiled query in VM context@> =
+void execute_query(HanoiVM *vm, TISCQuery *query) {
+    for (int i = 0; query->compiled_ops[i] != OP_END; ++i) {
+        vm_execute_op(vm, query->compiled_ops[i], query->symctx);
+    }
+    log_result(vm->result_stack);
+}
+
+@*1 Debug and Testing.
+
+@<Print compiled TISCQuery@> =
+void debug_print_query(const TISCQuery *q) {
+    printf("Query: %s\n", q->raw_input);
+    printf("Entropy Score: %.3f\n", q->entropy_score);
+    for (int i = 0; q->token_list->tokens[i] != NULL; ++i) {
+        printf("  Token[%d]: %s → %d\n", i, q->token_list->tokens[i], q->compiled_ops[i]);
+    }
+}
+
+@*1 TODO:
+
+- Support multi-stage recursion over T81Graph and T81Trie.
+- Integrate NLP engine for query prediction/refinement.
+- Cache common queries using ternary-mapped Bloom filters.
+- Enable stack mutability feedback loop on entropy delta.
+
+@*1 End.

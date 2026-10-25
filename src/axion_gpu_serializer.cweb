@@ -1,0 +1,257 @@
+@* axion_gpu_serializer.cweb | Axion GPU Dispatch Serializer with Context-Aware Promotion
+
+This module serializes GaiaRequest objects for GPU dispatch via /sys/axion_debug/gpu_request,
+supporting T729 macro execution with context-aware promotion. It integrates with `hanoivm_fsm.v`
+via PCIe/M.2, `axion-ai.cweb` via ioctls/debugfs, `hanoivm-core.cweb` and `hanoivm-runtime.cweb`
+via FFI, `hanoivm_vm.cweb`’s execution core, `hanoivm_firmware.cweb`’s firmware,
+`axion-gaia-interface.cweb`’s GPU dispatch, `axion_api.cweb`’s recursion optimization, and
+`advanced_ops.cweb`/`advanced_ops_ext.cweb` opcodes.
+
+Enhancements:
+- Support for intents (`GAIA_T729_DOT`, `GAIA_T729_INTENT`) and recursive opcodes (`RECURSE_FACT`).
+- Modular serialization table for extensibility.
+- Entropy logging via `axion-ai.cweb`’s debugfs.
+- Session memory integration with `axion-ai.cweb`’s `axion_session_t`.
+- FFI interface to `hanoivm-core.cweb` (Rust) and `hanoivm-runtime.cweb` (C).
+- Secure validation for TBIN, intents, and sysfs writes.
+- JSON visualization for requests and responses.
+- Support for `.hvm` test bytecode (`T81_MATMUL` + `TNN_ACCUM`).
+- Optimized for GPU-accelerated ternary computing.
+
+@c
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include "axion-gaia-interface.h"
+#include "hvm_context.h"
+#include "hvm_promotion.h"
+#include "axion-ai.h"
+#include "hanoivm_core.h"
+#include "hanoivm_runtime.h"
+
+#define GPU_REQUEST_PATH "/sys/axion_debug/gpu_request"
+#define GPU_RESPONSE_PATH "/sys/axion_debug/gpu_result"
+#ifndef VERBOSE_GPU_REQ
+  #define VERBOSE_GPU_REQ 1
+#endif
+#if VERBOSE_GPU_REQ
+  #define GPU_DEBUG(fmt, ...) fprintf(stderr, "[GPU_REQ DEBUG] " fmt, ##__VA_ARGS__)
+#else
+  #define GPU_DEBUG(fmt, ...)
+#endif
+#define MAX_LOG_MSG 128
+
+@<Serialization Strategy Table@>=
+typedef struct {
+    GAIAIntent intent;
+    int (*serialize)(const GaiaRequest* req, FILE* f, const char* backend);
+    const char* name;
+} SerializerStrategy;
+
+static int serialize_standard(const GaiaRequest* req, FILE* f, const char* backend) {
+    if (fwrite(&req->intent, sizeof(uint8_t), 1, f) != 1 ||
+        fwrite(&req->confidence, sizeof(uint8_t), 1, f) != 1 ||
+        fwrite(&req->tbin_len, sizeof(size_t), 1, f) != 1 ||
+        fwrite(req->tbin, sizeof(uint8_t), req->tbin_len, f) != req->tbin_len) {
+        return -1;
+    }
+    uint8_t backend_flag = (strcmp(backend, "cuda") == 0) ? 1 : 0;
+    if (fwrite(&backend_flag, sizeof(uint8_t), 1, f) != 1) return -1;
+    axion_log_entropy("SERIALIZE_STANDARD", req->intent);
+    return 0;
+}
+
+static SerializerStrategy serializers[] = {
+    { GAIA_EMIT_VECTOR, serialize_standard, "EMIT_VECTOR" },
+    { GAIA_RECONSTRUCT, serialize_standard, "RECONSTRUCT" },
+    // More in Part 2
+    { GAIA_UNKNOWN, NULL, NULL }
+};
+
+@<Serialization Strategy Implementations@>=
+static int serialize_t729_dot(const GaiaRequest* req, FILE* f, const char* backend) {
+    extern int rust_t729_intent_dispatch(int8_t opcode);
+    if (!rust_t729_intent_dispatch(OP_T729_DOT)) return -1;
+    if (fwrite(&req->intent, sizeof(uint8_t), 1, f) != 1 ||
+        fwrite(&req->confidence, sizeof(uint8_t), 1, f) != 1 ||
+        fwrite(&req->tbin_len, sizeof(size_t), 1, f) != 1 ||
+        fwrite(req->tbin, sizeof(uint8_t), req->tbin_len, f) != req->tbin_len) {
+        return -1;
+    }
+    uint8_t backend_flag = (strcmp(backend, "cuda") == 0) ? 1 : 0;
+    if (fwrite(&backend_flag, sizeof(uint8_t), 1, f) != 1) return -1;
+    axion_log_entropy("SERIALIZE_T729_DOT", req->intent);
+    return 0;
+}
+
+static int serialize_t729_intent(const GaiaRequest* req, FILE* f, const char* backend) {
+    extern int rust_t729_intent_dispatch(int8_t opcode);
+    if (!rust_t729_intent_dispatch(req->tbin[0])) return -1;
+    if (fwrite(&req->intent, sizeof(uint8_t), 1, f) != 1 ||
+        fwrite(&req->confidence, sizeof(uint8_t), 1, f) != 1 ||
+        fwrite(&req->tbin_len, sizeof(size_t), 1, f) != 1 ||
+        fwrite(req->tbin, sizeof(uint8_t), req->tbin_len, f) != req->tbin_len) {
+        return -1;
+    }
+    uint8_t backend_flag = (strcmp(backend, "cuda") == 0) ? 1 : 0;
+    if (fwrite(&backend_flag, sizeof(uint8_t), 1, f) != 1) return -1;
+    axion_log_entropy("SERIALIZE_T729_INTENT", req->intent);
+    return 0;
+}
+
+static SerializerStrategy serializers[] = {
+    { GAIA_EMIT_VECTOR, serialize_standard, "EMIT_VECTOR" },
+    { GAIA_RECONSTRUCT, serialize_standard, "RECONSTRUCT" },
+    { GAIA_FOLD_TREE, serialize_standard, "FOLD_TREE" },
+    { GAIA_ANALYZE, serialize_standard, "ANALYZE" },
+    { GAIA_T729_DOT, serialize_t729_dot, "T729_DOT" },
+    { GAIA_T729_INTENT, serialize_t729_intent, "T729_INTENT" },
+    { GAIA_UNKNOWN, NULL, NULL }
+};
+
+@<Core Serialization Function@>=
+int write_gpu_request_to_sysfs(const GaiaRequest* req, const char* backend, HVMContext* ctx) {
+    if (!req || !backend || !ctx) {
+        GPU_DEBUG("Invalid input parameters\n");
+        axion_log_entropy("SERIALIZE_INVALID", 0xFF);
+        return -1;
+    }
+    if (ctx->mode < MODE_T729) {
+        GPU_DEBUG("Promoting context to T729\n");
+        promote_to_t729(ctx);
+    }
+    FILE* f = fopen(GPU_REQUEST_PATH, "wb");
+    if (!f) {
+        GPU_DEBUG("Failed to open %s: %s\n", GPU_REQUEST_PATH, strerror(errno));
+        axion_log_entropy("SERIALIZE_OPEN_FAIL", errno);
+        return -1;
+    }
+    int ret = -1;
+    for (int i = 0; serializers[i].serialize; i++) {
+        if (serializers[i].intent == req->intent) {
+            ret = serializers[i].serialize(req, f, backend);
+            break;
+        }
+    }
+    fclose(f);
+    if (ret != 0) {
+        GPU_DEBUG("Serialization failed for intent %d\n", req->intent);
+        axion_log_entropy("SERIALIZE_FAIL", req->intent);
+    }
+    return ret;
+}
+
+@<Response Handling@>=
+int read_gpu_response_from_sysfs(GAIAResponse* res) {
+    FILE* f = fopen(GPU_RESPONSE_PATH, "rb");
+    if (!f) {
+        GPU_DEBUG("Failed to open %s: %s\n", GPU_RESPONSE_PATH, strerror(errno));
+        axion_log_entropy("RESPONSE_OPEN_FAIL", errno);
+        return -1;
+    }
+    if (fread(&res->success, sizeof(bool), 1, f) != 1 ||
+        fread(&res->entropy_delta, sizeof(float), 1, f) != 1 ||
+        fread(res->result_t729, sizeof(uint8_t), 243, f) != 243 ||
+        fread(res->explanation, sizeof(char), MAX_LOG_MSG, f) != MAX_LOG_MSG) {
+        GPU_DEBUG("Failed to read response\n");
+        axion_log_entropy("RESPONSE_READ_FAIL", 0xFF);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    axion_log_entropy("RESPONSE_READ", res->success);
+    return 0;
+}
+
+@<Visualization Hook@>=
+void serialize_visualize(const GaiaRequest* req, const GAIAResponse* res, char* out_json, size_t max_len) {
+    size_t len = snprintf(out_json, max_len,
+        "{\"intent\": %d, \"confidence\": %d, \"tbin_len\": %zu, \"tbin\": [",
+        req->intent, req->confidence, req->tbin_len);
+    for (size_t i = 0; i < req->tbin_len && i < 243 && len < max_len; i++) {
+        len += snprintf(out_json + len, max_len - len, "%d%s",
+                        req->tbin[i], i < req->tbin_len - 1 ? "," : "");
+    }
+    len += snprintf(out_json + len, max_len - len,
+        "], \"success\": %d, \"entropy_delta\": %.4f, \"result\": [",
+        res ? res->success : 0, res ? res->entropy_delta : 0.0);
+    if (res) {
+        for (int i = 0; i < T729_SIZE && len < max_len; i++) {
+            len += snprintf(out_json + len, max_len - len, "%d%s",
+                            res->result_t729[i], i < T729_SIZE - 1 ? "," : "");
+        }
+    }
+    len += snprintf(out_json + len, max_len - len, "]}");
+    axion_log_entropy("VISUALIZE_SERIALIZE", len & 0xFF);
+}
+
+@<Integration Hook@>=
+void axion_serialize_gpu_hook(const T729Macro* macro, const char* backend, HVMContext* ctx) {
+    GaiaRequest req = convert_t729_to_request(macro);
+    int ret = write_gpu_request_to_sysfs(&req, backend, ctx);
+    if (ret == 0) {
+        GAIAResponse res;
+        if (read_gpu_response_from_sysfs(&res) == 0) {
+            char json[256];
+            serialize_visualize(&req, &res, json, sizeof(json));
+            GPU_DEBUG("Serialized GPU request: %s\n", json);
+        }
+        axion_log_entropy("SERIALIZE_HOOK_SUCCESS", macro->intent);
+    } else {
+        axion_log_entropy("SERIALIZE_HOOK_FAIL", macro->intent);
+    }
+}
+
+@<Main Function@>=
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <tbin_file> <cuda|gaia>\n", argv[0]);
+        return 1;
+    }
+    const char* tbin_path = argv[1];
+    const char* backend = argv[2];
+    FILE* tf = fopen(tbin_path, "rb");
+    if (!tf) {
+        GPU_DEBUG("Failed to open %s: %s\n", tbin_path, strerror(errno));
+        axion_log_entropy("TBIN_OPEN_FAIL", errno);
+        return 1;
+    }
+    fseek(tf, 0, SEEK_END);
+    size_t len = ftell(tf);
+    fseek(tf, 0, SEEK_SET);
+    uint8_t* tbin = malloc(len);
+    if (!tbin) {
+        GPU_DEBUG("Memory allocation failed\n");
+        axion_log_entropy("TBIN_ALLOC_FAIL", 0xFF);
+        fclose(tf);
+        return 1;
+    }
+    if (fread(tbin, 1, len, tf) != len) {
+        GPU_DEBUG("Failed to read TBIN\n");
+        axion_log_entropy("TBIN_READ_FAIL", 0xFF);
+        free(tbin);
+        fclose(tf);
+        return 1;
+    }
+    fclose(tf);
+    GaiaRequest req = {
+        .tbin = tbin, .tbin_len = len, .confidence = 87, .intent = GAIA_T729_DOT
+    };
+    snprintf(req.session_id, sizeof(req.session_id), "S-%016lx", (uint64_t)&req);
+    axion_register_session(req.session_id);
+    HVMContext ctx = { .mode = MODE_T243, .call_depth = 3, .mode_flags = 0 };
+    int ret = write_gpu_request_to_sysfs(&req, backend, &ctx);
+    if (ret == 0) {
+        GAIAResponse res;
+        if (read_gpu_response_from_sysfs(&res) == 0) {
+            char json[256];
+            serialize_visualize(&req, &res, json, sizeof(json));
+            printf("Serialized GPU Request: %s\n", json);
+        }
+    }
+    free(tbin);
+    return ret;
+}
+
